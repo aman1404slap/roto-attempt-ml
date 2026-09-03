@@ -49,9 +49,16 @@ the elements that would teach it.
 MAX_OPEN_FRACTION = 0.9
 """Above this the element is a paint-stroke pass, not region roto.
 
-sh0230/L110 is 2515 shapes, 2515 of them open strokes; nfl_0080/MB 2 is 508 of 510. Both
-are single-key-by-construction hair and motion-blur passes. They are not what the POC
-predicts, and mixing them in teaches one key per shape.
+Fires on sh0230/L110 (2515 of 2515 shapes open) and nfl_0080/MB 2 (508 of 510). An open
+stroke is rendered as a width along a path, not as a filled region, so it is a different
+prediction target wearing the same B-spline clothes -- the model would have to learn a
+stroke width it is not asked to predict.
+
+The two are otherwise unalike, and it is worth not conflating them. L110 is hair: shapes
+live 4.2 frames and carry 4.0 keys each, so it is redrawn rather than animated, and it trips
+``over_keyed`` as well. MB 2 is a motion-blur pass that is genuinely animated -- 81.4 live
+frames and 25.0 keys per shape, a k/live of 0.31 that sits comfortably inside the kept range.
+MB 2 is excluded for what it draws, not for how it is keyed.
 """
 
 MIN_SHAPES = 3

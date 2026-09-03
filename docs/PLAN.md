@@ -142,9 +142,11 @@ alpha is a render of the answer. No noise, no ambiguity, one right answer. That 
 first step, but v1's number is not a production number. In deployment the input will be a
 plate or an AI matte with fuzzy, wrong edges, and that gap is deliberately deferred.
 
-**Motion blur, feather, and single-frame paint-stroke hair** are carried through as fields but
-are not prediction targets. Blur and feather are render settings, not spline structure — a
-blurred target teaches the model to bend geometry to compensate for a shutter.
+**Motion blur, feather, and open-stroke paint passes** are carried through as fields but are
+not prediction targets. Blur and feather are render settings, not spline structure — a blurred
+target teaches the model to bend geometry to compensate for a shutter. Open strokes are
+rendered as a width along a path rather than as a filled region, so they are a different
+target wearing the same B-spline clothes.
 
 ## Open items
 
