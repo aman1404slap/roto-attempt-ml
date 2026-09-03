@@ -9,6 +9,18 @@ point sits, and how each group moves.
 
 Two design choices are load-bearing.
 
+**Shape queries are per (element, shape), not per shape index.** The first design used one
+embedding table indexed by position in document order and shared it across elements, so shape
+500 of one element and shape 500 of another drew the same query vector. Nothing in a union
+alpha can tell those apart -- the picture shows a filled silhouette, not which contour is
+"shape 500" -- so the model had no way to resolve the ambiguity and stalled at ~64 px. Each
+element now owns a contiguous block of the table, 2753 rows in total.
+
+This is memorisation capacity, and for v1 that is the point: the task is to regenerate these
+shots, not to generalise to unseen ones. It also means **the v1 number does not transfer**.
+v2 must replace these embeddings with queries the encoder produces, and the gap between the
+two is the honest measure of what the encoder still has to learn.
+
 **No self-attention among shape queries.** A decoder that lets 1036 queries attend to each
 other costs O(S^2) and, on a 16-core CPU with no GPU, that alone would put a single epoch out
 of reach. Queries cross-attend to the image and not to each other. The cost is that shapes

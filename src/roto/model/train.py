@@ -51,15 +51,16 @@ class TrainState:
     history: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _batch(el: ElementData, idx: np.ndarray, device: str = 'cpu') -> dict[str, torch.Tensor]:
+def _batch(el: ElementData, idx: np.ndarray, shape_base: int = 0,
+           group_base: int = 0) -> dict[str, torch.Tensor]:
     a = torch.from_numpy(el.alphas[idx]).unsqueeze(1)
     return {
         'alpha': a,
         'points': torch.from_numpy(el.points[idx]),
         'live': torch.from_numpy(el.live[idx]),
         'affine': torch.from_numpy(el.affine[idx]),
-        'shape_ids': torch.arange(el.n_shapes)[None].expand(len(idx), -1),
-        'group_ids': torch.arange(el.n_groups)[None].expand(len(idx), -1),
+        'shape_ids': (torch.arange(el.n_shapes) + shape_base)[None].expand(len(idx), -1),
+        'group_ids': (torch.arange(el.n_groups) + group_base)[None].expand(len(idx), -1),
         'desc': torch.from_numpy(el.desc)[None].expand(len(idx), -1, -1),
         'point_mask': torch.from_numpy(el.point_mask)[None],
     }
@@ -87,12 +88,19 @@ def train(dataset_root: str | Path, out_dir: str | Path,
     els = load_dataset(dataset_root)
     for e in els:
         _ = e.alphas                                   # materialise once, up front
-    max_shapes = max(e.n_shapes for e in els)
-    max_groups = max(e.n_groups for e in els)
+    # Each element owns a contiguous block of the query tables, so shape identity is per
+    # (element, shape) rather than per index. See net.RotoNet.
+    shape_base, group_base, ns, ng = {}, {}, 0, 0
+    for e in els:
+        shape_base[e.element_id], group_base[e.element_id] = ns, ng
+        ns += e.n_shapes
+        ng += e.n_groups
+    max_shapes, max_groups = ns, ng
     max_points = max(e.points.shape[2] for e in els)
     max_coords = max(e.points.shape[3] for e in els)
     print(f'{len(els)} elements | {sum(len(e.frames) for e in els)} frames | '
-          f'Smax {max_shapes} Gmax {max_groups} Pmax {max_points} Cmax {max_coords}')
+          f'queries {max_shapes} shape / {max_groups} group  Pmax {max_points} '
+          f'Cmax {max_coords}')
 
     net = RotoNet(max_shapes, max_groups, max_points, max_coords, cfg.dim, cfg.depth)
     n_params = sum(p.numel() for p in net.parameters())
@@ -111,7 +119,8 @@ def train(dataset_root: str | Path, out_dir: str | Path,
         ei = int(rng.choice(len(els), p=weights))
         el = els[ei]
         idx = rng.choice(len(el.frames), size=min(cfg.batch, len(el.frames)), replace=False)
-        b = _batch(el, np.sort(idx))
+        b = _batch(el, np.sort(idx), shape_base[el.element_id],
+                   group_base[el.element_id])
 
         pts, aff = net(b['alpha'], b['shape_ids'], b['group_ids'], b['desc'])
         pts = pts[:, :, :el.points.shape[2], :el.points.shape[3]]
@@ -142,6 +151,8 @@ def train(dataset_root: str | Path, out_dir: str | Path,
                  'dim': cfg.dim, 'depth': cfg.depth},
         'config': asdict(cfg),
         'elements': [e.element_id for e in els],
+        'shape_base': shape_base,
+        'group_base': group_base,
         'n_params': n_params,
     }
     torch.save(ckpt, out / 'v1.pt')
