@@ -14,3 +14,6 @@ __pycache__/
 /runs/
 /viz/
 /reports/
+
+# v1 deliverables: trained model, results, figures
+/v1/
