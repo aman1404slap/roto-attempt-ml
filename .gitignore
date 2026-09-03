@@ -1,0 +1,16 @@
+# client archive material — anchored to the repo root so src/roto/data/ still tracks
+/data/
+
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# staged for deletion — superseded hit-and-trial work
+/_attic/
+
+# generated artifacts
+/datasets/
+/runs/
+/viz/
+/reports/
