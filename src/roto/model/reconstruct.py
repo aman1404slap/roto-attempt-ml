@@ -36,10 +36,36 @@ from .data import ElementData, load_element
 from .geometry import crop_to_local
 from .net import RotoNet
 
-DEFAULT_TOL_PX = 0.1
-"""Keyframe tolerance, in packet pixels. Measured sweep on ground-truth tracks: F1 peaks at
-0.1 (0.766) while 0.2 lands the key *count* within 4% of the artist's. 0.1 is the default
-because recall costs more than a few extra keys when the result is going to be rendered."""
+DEFAULT_TOL_PX = 1.0
+"""Keyframe tolerance, in packet pixels.
+
+On *ground-truth* tracks the best tolerance is 0.1 px (F1 0.766). On *predicted* tracks that
+value is badly wrong, and the reason is worth stating because it couples two components that
+look independent: the keyframe search cannot be tuned below the geometry's own noise floor.
+
+A predicted track carries a per-frame jitter of roughly the model's point error. Asked to
+reproduce that track within 0.1 px, the search must key almost every frame, because the noise
+alone exceeds the tolerance -- measured at **16.5x the artist's key count, F1 0.115**, which is
+worse over-keying than the learned head it replaced. The tolerance has to sit above the noise,
+not above the artist's own precision.
+
+So the operating point is chosen against predicted tracks, not ground-truth ones. Measured
+sweep over three elements spanning the quality range (``results/keyframe_operating_point_sweep.txt``):
+1.0 px with a 9-frame smoothing window gives the best rendered IoU of every combination tried,
+at 0.99x the artist's key count on the best-fit element."""
+
+SMOOTH_WINDOW = 9
+"""Frames of temporal smoothing applied to a predicted track before knots are chosen.
+
+The artist's true track is piecewise linear between sparse keys; the model's error is
+approximately independent frame to frame. A short centred average therefore removes a large
+part of the noise while leaving genuine motion almost untouched, which lets the search see the
+structure it is meant to find. Set to 1 to disable.
+
+Measured, at 1.0 px tolerance: turning smoothing on raises rendered soft-IoU on every element
+tried (0.9820 -> 0.9846, 0.9605 -> 0.9653, 0.7651 -> 0.7763) *and* cuts the key count from
+3.01x the artist's to 0.99x. Both improve together because the keys it removes were spent
+tracking noise, not motion."""
 
 
 @dataclass(slots=True)
@@ -117,8 +143,27 @@ def to_local(el: ElementData, crop_pts: np.ndarray) -> np.ndarray:
     return out
 
 
-def rebuild(el: ElementData, local_pts: np.ndarray, tol_px: float
-            ) -> tuple[RotoDoc, dict[str, Any]]:
+def smooth_track(track: np.ndarray, window: int) -> np.ndarray:
+    """Centred moving average along time, edges held. ``track`` is ``(T, ...)``."""
+    if window <= 1 or len(track) < 3:
+        return track
+    w = min(window, len(track) if len(track) % 2 else len(track) - 1)
+    if w % 2 == 0:
+        w -= 1
+    if w <= 1:
+        return track
+    pad = w // 2
+    padded = np.concatenate([np.repeat(track[:1], pad, 0), track,
+                             np.repeat(track[-1:], pad, 0)])
+    kernel = np.ones(w) / w
+    flat = padded.reshape(len(padded), -1)
+    out = np.stack([np.convolve(flat[:, j], kernel, mode='valid')
+                    for j in range(flat.shape[1])], axis=1)
+    return out.reshape(track.shape)
+
+
+def rebuild(el: ElementData, local_pts: np.ndarray, tol_px: float,
+            smooth: int = SMOOTH_WINDOW) -> tuple[RotoDoc, dict[str, Any]]:
     """Choose keys per shape and write a document carrying only those keys.
 
     The keyframe search runs on the point positions only, not on Bezier handles. Handles are
@@ -154,9 +199,14 @@ def rebuild(el: ElementData, local_pts: np.ndarray, tol_px: float
             n_true += len({k.frame for k in tshape.path})
             continue
 
-        track = np.stack([value(f)[:, 0, :] for f in live]) * el.px_per_norm
-        sel = select(track, live, tol_px)
-        shape.path = [Key(int(f), interp.get(int(f), 'linear'), value(f)) for f in sel.frames]
+        raw = np.stack([value(f) for f in live])
+        clean = smooth_track(raw, smooth)
+        sel = select(clean[:, :, 0, :] * el.px_per_norm, live, tol_px)
+        # Key values come from the smoothed track too -- selecting on a denoised curve and then
+        # storing the raw value at those frames would put the jitter straight back in.
+        pick = {int(f): i for i, f in enumerate(live)}
+        shape.path = [Key(int(f), interp.get(int(f), 'linear'), clean[pick[int(f)]])
+                      for f in sel.frames]
 
         truth = np.array(sorted({int(np.clip(k.frame, live[0], live[-1]))
                                  for k in tshape.path}), np.int32)
@@ -178,7 +228,7 @@ def rebuild(el: ElementData, local_pts: np.ndarray, tol_px: float
 
 def reconstruct(element_dir: str | Path, net: RotoNet, tol_px: float = DEFAULT_TOL_PX,
                 frames: Sequence[int] | None = None, shape_base: int = 0,
-                group_base: int = 0) -> Reconstruction:
+                group_base: int = 0, smooth: int = SMOOTH_WINDOW) -> Reconstruction:
     el = load_element(element_dir)
     crop_pts = predict_crop_points(net, el, shape_base, group_base)
 
@@ -187,7 +237,7 @@ def reconstruct(element_dir: str | Path, net: RotoNet, tol_px: float = DEFAULT_T
     point_err = float(err.mean())
 
     local = to_local(el, crop_pts)
-    doc, kstats = rebuild(el, local, tol_px)
+    doc, kstats = rebuild(el, local, tol_px, smooth)
 
     c = el.crop
     cfg = RenderConfig(supersample=2)
