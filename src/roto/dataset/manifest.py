@@ -1,27 +1,12 @@
-"""Which layers are training elements, and why the delivered EXRs no longer decide.
+"""Which Silhouette layers become training samples.
 
-An element is **one top-level layer of one .sfx**. That is the whole rule, and it is
-derived from the file itself -- there is no hand-maintained table any more.
+A training sample is **one top-level layer of one ``.sfx``**, because that is the unit that
+renders to one matte. The list is derived from the files themselves -- there is no
+hand-maintained table.
 
-The previous manifest was a *recovered* mapping from layer union to delivered EXR channel,
-found by brute-force search and scored against the EXRs. It existed because the EXR was the
-training target, so an element had to be something an EXR could certify. Under the clean
-alpha strategy the EXR is reference only: the input is rendered from the artist's own
-splines, so the layer *is* the element and no channel mapping is needed to select it.
-
-Three blockers dissolve with it, and they are worth naming because they were on the
-ask-the-client list: the missing Nuke render-node mapping (which cost 14 of 23
-deliverables), the sh0230 project/matte disagreement, and the vendor colour transform on two
-shots' alpha. All three are EXR-side problems, and the EXR has left the training loop.
-
-``roto.data.elements`` is kept, unchanged, because ``roto verify`` still scores against the
-EXRs -- that check is what gives us confidence in the renderer, and it stays.
-
-EXCLUSIONS
-----------
-Exclusion is by measurement, not taste, and each rule states the number it fires on.
-``keys_per_live_frame`` is the sparsity the model has to learn to reproduce; ``open_frac``
-is the share of shapes that are stroked open paths rather than filled regions.
+Exclusion is by measurement, and each rule states the number it fires on. ``keys_per_live_frame``
+is how densely the artist keyed the layer; ``open_frac`` is the share of its shapes that are
+stroked open paths rather than filled regions.
 """
 from __future__ import annotations
 
@@ -29,25 +14,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from ..data.shots import Shot, find_shots
-from ..eval.match import Candidate, candidate_layers
+from ..shots import Shot, find_shots
+from .layers import LayerRef, top_layers
 from ..ir import Layer, RotoDoc, Shape, opacity_at
 from ..sfx.read import read_sfx
 
 MANIFEST_VERSION = 2
 
 MAX_KEYS_PER_LIVE_FRAME = 0.75
-"""Above this the element is keyed so densely it teaches key-every-frame.
+"""Above this the layer is keyed so densely it teaches key-every-frame.
 
 Measured across the 18 top-level layers: 14 sit at 0.03-0.59, and four sit at 0.95-1.59.
 There is no continuum between them -- the gap is a factor of 1.6 -- so the threshold is
 reading a real bimodality rather than cutting an arbitrary tail. Over-keying is the
 project's measured failure mode (precision 0.21-0.44, ~2.5x too many keys), and these are
-the elements that would teach it.
+the layers that would teach it.
 """
 
 MAX_OPEN_FRACTION = 0.9
-"""Above this the element is a paint-stroke pass, not region roto.
+"""Above this the layer is a paint-stroke pass, not region roto.
 
 Fires on sh0230/L110 (2515 of 2515 shapes open) and nfl_0080/MB 2 (508 of 510). An open
 stroke is rendered as a width along a path, not as a filled region, so it is a different
@@ -66,7 +51,7 @@ MIN_SHAPES = 3
 
 
 @dataclass(slots=True)
-class ElementStats:
+class LayerStats:
     shapes: int
     open_strokes: int
     ephemeral: int
@@ -92,13 +77,13 @@ class ElementStats:
 
 
 @dataclass(slots=True)
-class Element:
+class RotoLayer:
     """One top-level layer of one shot: the unit the dataset is built from."""
-    element_id: str
+    layer_id: str
     shot: str
-    layer: str
+    name: str
     uuid: str | None
-    stats: ElementStats
+    stats: LayerStats
     excluded_by: tuple[str, ...] = ()
 
     @property
@@ -106,7 +91,7 @@ class Element:
         return not self.excluded_by
 
     def as_dict(self) -> dict[str, Any]:
-        return {'element_id': self.element_id, 'shot': self.shot, 'layer': self.layer,
+        return {'layer_id': self.layer_id, 'shot': self.shot, 'name': self.name,
                 'uuid': self.uuid, 'excluded_by': list(self.excluded_by),
                 'stats': self.stats.as_dict()}
 
@@ -131,11 +116,11 @@ def _groups_of(node: Layer | Shape) -> Iterator[int]:
             yield from _groups_of(child)
 
 
-def measure(doc: RotoDoc, root: Layer) -> ElementStats:
+def measure(doc: RotoDoc, root: Layer) -> LayerStats:
     shapes = list(_shapes_of(root))
     groups = list(_groups_of(root)) or [0]
     live = sum(1 for s in shapes for f in range(doc.duration) if opacity_at(s, f) > 0.5)
-    return ElementStats(
+    return LayerStats(
         shapes=len(shapes),
         open_strokes=sum(1 for s in shapes if not s.closed),
         ephemeral=sum(1 for s in shapes if s.opacity and len(s.opacity) > 1),
@@ -147,7 +132,7 @@ def measure(doc: RotoDoc, root: Layer) -> ElementStats:
     )
 
 
-def exclusions(stats: ElementStats) -> tuple[str, ...]:
+def exclusions(stats: LayerStats) -> tuple[str, ...]:
     out = []
     if stats.shapes < MIN_SHAPES:
         out.append(f'too_few_shapes({stats.shapes}<{MIN_SHAPES})')
@@ -158,13 +143,13 @@ def exclusions(stats: ElementStats) -> tuple[str, ...]:
     return tuple(out)
 
 
-def element_id(shot: str, layer: str) -> str:
+def layer_id(shot: str, layer: str) -> str:
     return f'{shot}__{layer.replace("/", "_").replace(" ", "_")}'
 
 
-def discover(data_root: str | Path) -> list[Element]:
-    """Every top-level layer of every shot, measured and tiered. No EXR involved."""
-    out: list[Element] = []
+def discover(data_root: str | Path) -> list[RotoLayer]:
+    """Every top-level layer of every shot, measured and screened against the rules above."""
+    out: list[RotoLayer] = []
     for shot in find_shots(data_root):
         if shot.sfx is None:
             continue
@@ -173,23 +158,27 @@ def discover(data_root: str | Path) -> list[Element]:
             stats = measure(doc, root)
             if stats.shapes == 0:
                 continue
-            out.append(Element(element_id(shot.name, root.name), shot.name, root.name,
+            out.append(RotoLayer(layer_id(shot.name, root.name), shot.name, root.name,
                                root.uuid, stats, exclusions(stats)))
     return out
 
 
-def resolve(doc: RotoDoc, element: Element) -> list[Candidate]:
-    """Locate the element's top-level layer in ``doc``, by uuid with a name cross-check."""
-    cands = [c for c in candidate_layers(doc, max_depth=0)]
-    if element.uuid:
-        for c in cands:
-            if c.layer.uuid == element.uuid:
-                if c.label != element.layer:
-                    raise KeyError(f'{element.element_id}: uuid is {c.label!r}, manifest '
-                                   f'says {element.layer!r} -- rediscover the manifest')
-                return [c]
-    matches = [c for c in cands if c.label == element.layer]
+def resolve(doc: RotoDoc, layer: RotoLayer) -> LayerRef:
+    """Find this layer in ``doc``, by uuid where there is one, with a name cross-check.
+
+    A uuid/name disagreement is raised rather than resolved silently -- it means the manifest
+    was built from a different save of the project than the one being read.
+    """
+    refs = top_layers(doc)
+    if layer.uuid:
+        for r in refs:
+            if r.layer.uuid == layer.uuid:
+                if r.name != layer.name:
+                    raise KeyError(f'{layer.layer_id}: uuid is {r.name!r}, manifest says '
+                                   f'{layer.name!r} -- rediscover the manifest')
+                return r
+    matches = [r for r in refs if r.name == layer.name]
     if len(matches) != 1:
-        raise KeyError(f'{element.element_id}: {len(matches)} layers named '
-                       f'{element.layer!r} -- rediscover the manifest')
-    return matches
+        raise KeyError(f'{layer.layer_id}: {len(matches)} layers named {layer.name!r} '
+                       f'-- rediscover the manifest')
+    return matches[0]

@@ -53,14 +53,14 @@ def read_xml_bytes(path: str | Path) -> tuple[bytes, str]:
 
 # ---- small helpers -------------------------------------------------------------
 
-def _props(el: ET.Element) -> dict[str, ET.Element]:
+def _props(el: ET.RotoLayer) -> dict[str, ET.RotoLayer]:
     container = el.find('Properties')
     if container is None:
         return {}
     return {p.get('id'): p for p in container.findall('Property') if p.get('id')}
 
 
-def _value(props: dict[str, ET.Element], name: str) -> str | None:
+def _value(props: dict[str, ET.RotoLayer], name: str) -> str | None:
     p = props.get(name)
     if p is None:
         return None
@@ -68,7 +68,7 @@ def _value(props: dict[str, ET.Element], name: str) -> str | None:
     return None if v is None else (v.text or '')
 
 
-def _float(props: dict[str, ET.Element], name: str, default: float = 0.0) -> float:
+def _float(props: dict[str, ET.RotoLayer], name: str, default: float = 0.0) -> float:
     txt = _value(props, name)
     if not txt:
         return default
@@ -76,7 +76,7 @@ def _float(props: dict[str, ET.Element], name: str, default: float = 0.0) -> flo
     return float(m.group()) if m else default
 
 
-def _bool(props: dict[str, ET.Element], name: str) -> bool:
+def _bool(props: dict[str, ET.RotoLayer], name: str) -> bool:
     return (_value(props, name) or '').strip().lower() == 'true'
 
 
@@ -87,7 +87,7 @@ def _pairs(text: str | None) -> np.ndarray:
                     dtype=np.float64)
 
 
-def _scalar_track(prop: ET.Element | None) -> list[Key] | None:
+def _scalar_track(prop: ET.RotoLayer | None) -> list[Key] | None:
     """A track of single numbers, e.g. opacity."""
     if prop is None:
         return None
@@ -109,7 +109,7 @@ _TRS_DEFAULTS = {'position': (0.0, 0.0), 'anchor': (0.0, 0.0),
                  'scale': (1.0, 1.0), 'rotate': (0.0,)}
 
 
-def _numeric_track(prop: ET.Element | None) -> list[Key] | None:
+def _numeric_track(prop: ET.RotoLayer | None) -> list[Key] | None:
     """A track of numeric vectors. Falls back to a constant ``<Value>`` as a single key.
 
     Unlike ``_scalar_track`` this keeps every component, which TRS needs: ``position`` is a
@@ -132,7 +132,7 @@ def _numeric_track(prop: ET.Element | None) -> list[Key] | None:
     return [Key(0, 'hold', np.array(nums, dtype=np.float64))] if nums else None
 
 
-def _trs_tracks(props: dict[str, ET.Element]) -> dict[str, list[Key]]:
+def _trs_tracks(props: dict[str, ET.RotoLayer]) -> dict[str, list[Key]]:
     """Non-identity ``transform.*`` tracks only -- identity ones are noise in the IR."""
     out: dict[str, list[Key]] = {}
     for name, default in _TRS_DEFAULTS.items():
@@ -147,7 +147,7 @@ def _trs_tracks(props: dict[str, ET.Element]) -> dict[str, list[Key]]:
     return out
 
 
-def _matrix_track(prop: ET.Element | None) -> list[Key] | None:
+def _matrix_track(prop: ET.RotoLayer | None) -> list[Key] | None:
     """A track of 4x4 matrices. Empty ``<Value/>`` means identity -- represented as None."""
     if prop is None:
         return None
@@ -162,7 +162,7 @@ def _matrix_track(prop: ET.Element | None) -> list[Key] | None:
     return out or None
 
 
-def _path_track(prop: ET.Element | None, name: str) -> tuple[list[Key], bool, str | None]:
+def _path_track(prop: ET.RotoLayer | None, name: str) -> tuple[list[Key], bool, str | None]:
     """Returns ``(keys, closed, path_type)``. Key values are (n_points, k, 2)."""
     if prop is None:
         return [], True, None
@@ -190,7 +190,7 @@ def _path_track(prop: ET.Element | None, name: str) -> tuple[list[Key], bool, st
 
 # ---- object tree ---------------------------------------------------------------
 
-def _shape(el: ET.Element) -> Shape | None:
+def _shape(el: ET.RotoLayer) -> Shape | None:
     props = _props(el)
     name = el.get('label') or el.get('id') or '?'
     keys, closed, path_type = _path_track(props.get('path'), name)
@@ -214,7 +214,7 @@ def _shape(el: ET.Element) -> Shape | None:
     )
 
 
-def _layer(el: ET.Element) -> Layer:
+def _layer(el: ET.RotoLayer) -> Layer:
     props = _props(el)
     layer = Layer(
         name=el.get('label') or el.get('id') or '?',
@@ -255,7 +255,7 @@ def read_sfx(path: str | Path, validate: bool = True) -> RotoDoc:
             source_path = node.text if node is not None else None
             source_label = src.get('label')
     if width is None:
-        raise SfxParseError(f'{path}: no Source element carrying width/height')
+        raise SfxParseError(f'{path}: no Source layer carrying width/height')
 
     duration, frame_rate, start_frame = 0, 24.0, 1001
     for sess in root.iter('Session'):

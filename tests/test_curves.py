@@ -1,6 +1,6 @@
 """The B-spline -> Bezier conversion must be exact, not approximate.
 
-If it drifts, every raster loss and every DiffVG gradient is quietly wrong.
+If it drifts, every rendered matte and every geometry loss is quietly wrong.
 """
 import numpy as np
 import pytest

@@ -1,13 +1,13 @@
-"""Fixed-size crop window that tracks the element across the frame.
+"""Fixed-size crop window that tracks the layer across the frame.
 
-The obvious choice -- one static crop covering the element's union bbox over all frames --
+The obvious choice -- one static crop covering the layer's union bbox over all frames --
 fails badly on anything that travels: ``nfl_0200``'s person-and-chair is a ~500x380px object
 crossing the entire 2880px frame, so its union bbox is larger than the frame and the object
 ends up occupying 1% of the crop. The opposite extreme, a crop refitted per frame, would make
 the *scale* time-varying and point distances incomparable between frames.
 
 So the window size, and therefore the scale, are constant, and only the translation varies
-per frame. The offsets are data the model is given, not motion it has to infer; the element's
+per frame. The offsets are data the model is given, not motion it has to infer; the layer's
 real motion stays where it belongs, in the layer transform track.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ class CropConfig:
     supersample: int = 4
     """Higher than the render default of 2 because a crop is cheap: 512 at ss=4 is 2048."""
     margin: float = 0.08
-    """Padding around the element's bbox, as a fraction of its longer side."""
+    """Padding around the layer's bbox, as a fraction of its longer side."""
     mode: str = 'tracking'
     """``'tracking'``: constant window size, per-frame offset. ``'static'``: one fixed box."""
     min_crop_px: int = 64
@@ -57,7 +57,7 @@ def frame_bboxes(doc: RotoDoc, frames: Sequence[int], cfg: CropConfig,
         if bb is not None:
             out[f] = tuple(v / cfg.bbox_scale for v in bb)
     if not out:
-        raise ValueError('element renders empty on every frame')
+        raise ValueError('layer renders empty on every frame')
     return out
 
 
@@ -66,8 +66,8 @@ def crop_plan(doc: RotoDoc, frames: Sequence[int], cfg: CropConfig,
     """Window size from the largest single-frame bbox; offset per frame from its centre.
 
     Sizing on the largest *single-frame* bbox rather than the union across frames is the
-    whole point: a translating element's union spans its entire path, while any one frame
-    spans only the element.
+    whole point: a translating layer's union spans its entire path, while any one frame
+    spans only the layer.
     """
     boxes = frame_bboxes(doc, frames, cfg, render_cfg)
     if cfg.mode == 'static':
@@ -84,7 +84,7 @@ def crop_plan(doc: RotoDoc, frames: Sequence[int], cfg: CropConfig,
     side = max(max(max(b[2], b[3]) for b in boxes.values()), float(cfg.min_crop_px))
     size = int(round(side * (1.0 + 2.0 * cfg.margin)))
 
-    # Frames where the element renders empty inherit the last known offset, so the window
+    # Frames where the layer renders empty inherit the last known offset, so the window
     # does not jump for a shape that briefly disappears.
     offsets: dict[int, tuple[int, int]] = {}
     last = None
@@ -94,7 +94,7 @@ def crop_plan(doc: RotoDoc, frames: Sequence[int], cfg: CropConfig,
             offsets[f] = last if last is not None else (0, 0)
             continue
         cx, cy = bb[0] + bb[2] / 2.0, bb[1] + bb[3] / 2.0
-        # Deliberately not clamped to the frame: keeping the element centred matters more
+        # Deliberately not clamped to the frame: keeping the layer centred matters more
         # than staying in bounds, and outside the source simply renders empty.
         last = (int(round(cx - size / 2.0)), int(round(cy - size / 2.0)))
         offsets[f] = last

@@ -72,10 +72,10 @@ def _panel(ax, title: str, subtitle: str = '') -> None:
                 color='#9aa0a6', fontsize=8)
 
 
-def element_figure(element_dir: str | Path, artist: RotoDoc, model: RotoDoc, frame: int,
+def element_figure(layer_dir: str | Path, artist: RotoDoc, model: RotoDoc, frame: int,
                    crop: dict, soft: float, hard: float, out_px: int,
-                   element_id: str, extra: str = '') -> Figure:
-    alpha = load_alpha(element_dir, frame)
+                   layer_id: str, extra: str = '') -> Figure:
+    alpha = load_alpha(layer_dir, frame)
     fig, axes = plt.subplots(1, 3, figsize=(12, 4.5), facecolor=BACKGROUND)
     fig.subplots_adjust(left=0.02, right=0.98, top=0.84, bottom=0.03, wspace=0.06)
 
@@ -96,13 +96,13 @@ def element_figure(element_dir: str | Path, artist: RotoDoc, model: RotoDoc, fra
     _panel(axes[2], 'Reconstructed splines',
            f'soft IoU {soft:.4f}   IoU {hard:.4f}')
 
-    fig.suptitle(f'{element_id}    frame {frame}{"    " + extra if extra else ""}',
+    fig.suptitle(f'{layer_id}    frame {frame}{"    " + extra if extra else ""}',
                  color='#e8eaed', fontsize=10, x=0.02, ha='left', y=0.955)
     return fig
 
 
 def contact_sheet(rows: Sequence[dict], out_path: str | Path, title: str) -> Path:
-    """One page: each row is an element, three panels wide."""
+    """One page: each row is an layer, three panels wide."""
     n = len(rows)
     fig, axes = plt.subplots(n, 3, figsize=(11, 3.5 * n), facecolor=BACKGROUND,
                              squeeze=False)
@@ -124,7 +124,7 @@ def contact_sheet(rows: Sequence[dict], out_path: str | Path, title: str) -> Pat
         for xy in polylines(row['model'], row['frame'], row['crop']):
             axes[r][2].plot(xy[:, 0], xy[:, 1], color=MODEL_COLOUR, lw=0.6)
 
-        axes[r][0].set_title(f'{row["element_id"]}  ·  frame {row["frame"]}',
+        axes[r][0].set_title(f'{row["layer_id"]}  ·  frame {row["frame"]}',
                              color='#e8eaed', fontsize=8, loc='left', pad=4)
         axes[r][1].set_title('clean alpha (model input)', color='#9aa0a6',
                              fontsize=8, loc='left', pad=4)

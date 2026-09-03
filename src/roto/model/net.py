@@ -3,18 +3,18 @@
 Scope, stated plainly because the number this produces is easy to over-read. The shape
 *breakdown* is given -- how many shapes, how many control points each, which transform group
 each belongs to, and which frames each is alive for. That is the teacher-forced setting the
-handoff specifies, and it is what makes v1 a reconstruction result rather than a roto result.
+model is given, and it is what makes v1 a reconstruction result rather than a roto result.
 What the network actually has to produce from the picture is the geometry: where every control
 point sits, and how each group moves.
 
 Two design choices are load-bearing.
 
-**Shape queries are per (element, shape), not per shape index.** The first design used one
-embedding table indexed by position in document order and shared it across elements, so shape
-500 of one element and shape 500 of another drew the same query vector. Nothing in a union
+**Shape queries are per (layer, shape), not per shape index.** The first design used one
+embedding table indexed by position in document order and shared it across layers, so shape
+500 of one layer and shape 500 of another drew the same query vector. Nothing in a union
 alpha can tell those apart -- the picture shows a filled silhouette, not which contour is
 "shape 500" -- so the model had no way to resolve the ambiguity and stalled at ~64 px. Each
-element now owns a contiguous block of the table, 2753 rows in total.
+layer now owns a contiguous block of the table, 2753 rows in total.
 
 This is memorisation capacity, and for v1 that is the point: the task is to regenerate these
 shots, not to generalise to unseen ones. It also means **the v1 number does not transfer**.

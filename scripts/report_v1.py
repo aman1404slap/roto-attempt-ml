@@ -1,17 +1,17 @@
-"""Reconstruct every element from the trained model, score it, and write the v1 deliverables.
+"""Reconstruct every layer from the trained model, score it, and write the v1 deliverables.
 
 Produces, under the output directory:
 
-    results/reconstruction.json   per-element numbers and the run's totals
-    figures/<element_id>.png      artist splines | clean alpha | reconstruction
-    figures/contact_sheet.png     up to ten elements on one page
+    results/reconstruction.json   per-layer numbers and the run's totals
+    figures/<layer_id>.png      artist splines | clean alpha | reconstruction
+    figures/contact_sheet.png     up to ten layers on one page
 
 The frame shown in each figure is chosen at random, with a fixed seed, from the frames where
-the element actually draws something. Picking the best frame would make the figures a highlight
+the layer actually draws something. Picking the best frame would make the figures a highlight
 reel; picking the worst would make them a bug report. A seeded random frame is the only choice
 that stays honest when the numbers move.
 
-The coverage filter is not cosmetic. Several elements have frames where every shape is switched
+The coverage filter is not cosmetic. Several layers have frames where every shape is switched
 off, and an empty render against an empty target scores a perfect IoU -- so an unfiltered
 random pick can put a blank panel, captioned 1.0000, at the top of the contact sheet. That is
 a meaningless number in the most prominent position on the page.
@@ -39,13 +39,13 @@ from roto.sfx.json_ir import from_json_ir                               # noqa: 
 MIN_COVERAGE = 0.02
 """Alpha coverage a frame needs before it can be chosen for a figure.
 
-Below this the element is essentially not drawn at that frame, and both the panel and the IoU
+Below this the layer is essentially not drawn at that frame, and both the panel and the IoU
 beside it stop meaning anything."""
 
 
-def pick_frame(element_dir: Path, rng: np.random.Generator) -> int:
-    """A seeded random frame on which the element actually draws something."""
-    meta = json.loads((element_dir / 'meta.json').read_text())
+def pick_frame(layer_dir: Path, rng: np.random.Generator) -> int:
+    """A seeded random frame on which the layer actually draws something."""
+    meta = json.loads((layer_dir / 'meta.json').read_text())
     frames = meta['frames']['index']
     cover = meta['frames']['coverage']
     ok = [f for f, c in zip(frames, cover) if c >= MIN_COVERAGE]
@@ -64,7 +64,7 @@ def main() -> None:
     ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--figures-only', action='store_true',
                     help='reuse an existing reconstruction.json and redraw the figures; '
-                         'renders one frame per element instead of all of them')
+                         'renders one frame per layer instead of all of them')
     args = ap.parse_args()
 
     net, ck = load_model(args.checkpoint)
@@ -83,7 +83,7 @@ def main() -> None:
                           frames=[frame] if args.figures_only else None)
         s = rec.summary()
         rows.append(s)
-        print(f'{rec.element_id[:52]:<53} soft IoU {s["mean_soft_iou"]:.4f}  '
+        print(f'{rec.layer_id[:52]:<53} soft IoU {s["mean_soft_iou"]:.4f}  '
               f'IoU {s["mean_iou"]:.4f}  pt {s["point_err_px"]:6.2f}px  '
               f'keys x{s["key_ratio"]:.2f}  F1 {s["key_f1"]:.3f}')
 
@@ -91,22 +91,22 @@ def main() -> None:
         artist = from_json_ir(json.loads((d / 'target_ir.json').read_text()))
         i = int(np.where(rec.frames == frame)[0][0])
         fig = element_figure(d, artist, rec.doc, frame, el.crop, float(rec.soft_iou[i]),
-                             float(rec.iou[i]), el.out_px, rec.element_id,
+                             float(rec.iou[i]), el.out_px, rec.layer_id,
                              extra=f'{el.n_shapes} shapes')
-        fig.savefig(out / 'figures' / f'{rec.element_id}.png', dpi=140,
+        fig.savefig(out / 'figures' / f'{rec.layer_id}.png', dpi=140,
                     facecolor=fig.get_facecolor())
         plt.close(fig)
         sheet.append({'dir': d, 'frame': frame, 'artist': artist, 'model': rec.doc,
                       'crop': el.crop, 'out_px': el.out_px, 'soft': float(rec.soft_iou[i]),
-                      'element_id': rec.element_id})
+                      'layer_id': rec.layer_id})
 
     sheet.sort(key=lambda r: -r['soft'])
     contact_sheet(sheet[:args.max_figures], out / 'figures' / 'contact_sheet.png',
-                  f'roto v1 — reconstruction from clean alpha ({len(sheet)} elements)')
+                  f'roto v1 — reconstruction from clean alpha ({len(sheet)} layers)')
 
     w = np.array([r['frames'] for r in rows], float)
     totals = {
-        'elements': len(rows),
+        'layers': len(rows),
         'frames': int(w.sum()),
         'tol_px': args.tol,
         'checkpoint': str(args.checkpoint),
@@ -118,7 +118,7 @@ def main() -> None:
         'keys_artist': int(sum(r['keys_artist'] for r in rows)),
         'key_f1': float(np.average([r['key_f1'] for r in rows],
                                    weights=[r['keys_artist'] for r in rows])),
-        'per_element': rows,
+        'per_layer': rows,
     }
     totals['key_ratio'] = totals['keys_predicted'] / max(1, totals['keys_artist'])
     if not args.figures_only:

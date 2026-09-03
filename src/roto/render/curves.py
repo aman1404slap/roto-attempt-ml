@@ -2,7 +2,7 @@
 
 The archive is authored in uniform cubic B-splines. We keep that as the native
 representation (see ir.py) and convert only at a render boundary -- for our own
-rasteriser, or for DiffVG during training, which consumes cubic Bezier paths.
+rasteriser, which consumes cubic Bezier paths.
 
 The conversion is exact, not an approximation: a uniform cubic B-spline segment *is* a
 cubic Bezier segment, just written in a different basis.
@@ -26,7 +26,7 @@ def _clamp_open(P: np.ndarray) -> np.ndarray:
 
     NOTE: unverified against Silhouette's own open-spline convention. Open shapes are 51%
     of the archive (strokes), so this is worth checking against the reference renderer
-    before trusting stroke geometry. Tracked in POC.md open questions.
+    before trusting stroke geometry.
     """
     return np.vstack([P[0], P[0], *P, P[-1], P[-1]])
 

@@ -3,7 +3,7 @@
 The first version of this model predicted control points directly in the IR's local
 normalised space and stalled at ~260 px mean error. The reason is a mismatch of ranges rather
 than a shortage of capacity: local coordinates are absolute positions in the *document*, so
-they span roughly +/-0.5, while a tracking crop of a small element covers as little as 0.059
+they span roughly +/-0.5, while a tracking crop of a small layer covers as little as 0.059
 of that -- ``px_per_norm`` reaches 4365 on ``nfl_0200/green``. The network was being asked to
 regress an absolute document coordinate eight times larger than anything visible in its input,
 from a picture that cannot disambiguate it.

@@ -1,4 +1,4 @@
-"""Per-shape arrays derived from an element's document, plus the shape index."""
+"""Per-shape arrays derived from an layer's document, plus the shape index."""
 from __future__ import annotations
 
 from typing import Any, Sequence
@@ -28,7 +28,7 @@ def derive_tensors(doc: RotoDoc, frames: Sequence[int]
     """Per-shape arrays for the losses, plus an index describing each shape.
 
     Arrays are named ``<field>/<i>`` where ``i`` is the shape's position in the index, which
-    is document order -- the deterministic teacher-forcing sequence the handoff asks for.
+    is document order, which is the order the model is taught to emit them in.
     """
     # The transform track is a property of the document, not of which frames we chose to
     # rasterise, so it is sampled densely even when alpha is emitted on a stride. Sampling

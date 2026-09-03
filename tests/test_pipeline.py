@@ -1,8 +1,8 @@
-"""Tests for the pieces merged in from roto_toolkit.py.
+"""Core pipeline invariants: shot discovery, IR round-trip, transforms, soft edges.
 
-Covers the four things the merge was for: shot discovery across both directory layouts,
-toolkit-schema JSON round-tripping, the greedy layer->channel matcher, and the soft-edge /
-soft-IoU pair. Plus TRS composition, which neither codebase had exercised.
+These are the safety net under everything else. If the IR cannot survive a round trip, or a
+transform composes in the wrong order, every number downstream is wrong in a way that looks
+like a model problem.
 """
 from __future__ import annotations
 
@@ -12,15 +12,15 @@ import math
 import numpy as np
 import pytest
 
-from roto.data.shots import find_shot, find_shots
-from roto.eval.match import assign_channels, candidate_layers
-from roto.eval.metrics import dice, iou, soft_iou
+from roto.shots import find_shot, find_shots
+from roto.dataset.layers import top_layers
+from roto.metrics import iou, soft_iou
 from roto.ir import Key, Layer, RotoDoc, Shape, is_ephemeral, shape_class
 from roto.render.raster import RenderConfig, layer_matrix, render, trs_matrix
 from roto.sfx.json_ir import from_json_ir, to_json_ir
 from roto.sfx.read import read_sfx
 
-from fixtures import DATA
+from common import DATA
 
 
 # ---- shot discovery ------------------------------------------------------------
@@ -28,24 +28,13 @@ from fixtures import DATA
 def test_finds_all_six_shots_across_both_layouts():
     shots = find_shots(DATA)
     assert len(shots) == 6
-    assert all(s.is_usable for s in shots)
+    assert all(s.sfx is not None for s in shots)
     # Two layouts: scene/*.sfx + matte01/, and <name>_SFX_script_v02/ + <name>_matte_*/
     by_name = {s.name: s for s in shots}
     assert by_name['nfl_0200_bg01_v001_compplate_roto_v001'].sfx.parent.name == 'scene'
     tvc = by_name['TVC_SHOTS_sh0260_BG01_v003_roto_v02']
     assert tvc.sfx.suffix == '.sfx'
-    assert len(tvc.mattes) == 3          # L100 / L110 / L120 delivered separately
 
-
-def test_sample_frames_span_the_sequence():
-    shot = find_shot(f'{DATA}/nfl_0200_bg01_v001_compplate_roto_v001')
-    frames = shot.frames()
-    assert frames[0] == 1001 and len(frames) == 191
-    assert shot.sample_frames(3) == [1001, 1096, 1191]
-    assert shot.sample_frames(1) == [1001]
-
-
-# ---- toolkit-schema JSON -------------------------------------------------------
 
 @pytest.mark.parametrize('shot', [s.name for s in find_shots(DATA)])
 def test_json_ir_round_trips_and_renders_identically(shot):
@@ -58,7 +47,7 @@ def test_json_ir_round_trips_and_renders_identically(shot):
     np.testing.assert_array_equal(a, b)
 
 
-def test_json_ir_keeps_toolkit_schema_keys():
+def test_json_ir_keeps_its_documented_keys():
     doc = read_sfx(find_shot(f'{DATA}/nfl_0200_bg01_v001_compplate_roto_v001').sfx)
     obj = to_json_ir(doc)
     assert set(obj['session']) == {'width', 'height', 'startFrame', 'duration', 'frameRate'}
@@ -87,7 +76,7 @@ def test_json_ir_keeps_toolkit_schema_keys():
 
 
 def test_json_ir_preserves_interleaved_child_order():
-    """The toolkit schema splits shapes and layers into separate lists, losing their
+    """The IR schema splits shapes and layers into separate lists, losing their
     relative order. Order is the model's teacher-forcing sequence, so we keep it."""
     doc = RotoDoc(width=100, height=100, duration=2, roots=[Layer(name='root', children=[
         Shape(name='s0', path=[Key(0, 'linear', np.zeros((3, 1, 2)))]),
@@ -122,7 +111,7 @@ def test_trs_rotation_composes_before_the_baked_matrix():
 
 
 def test_trs_is_identity_on_every_measured_shot():
-    """Documented in the handoff and now actually checked: no shot relies on TRS, so it
+    """No shot in the archive relies on TRS, so it
     cannot explain any IoU gap. The support exists so a future shot cannot fail silently."""
     for shot in find_shots(DATA):
         doc = read_sfx(shot.sfx, validate=False)
@@ -134,7 +123,7 @@ def test_trs_is_identity_on_every_measured_shot():
 
 def test_supersampling_is_on_by_default_and_produces_soft_edges():
     assert RenderConfig().supersample == 2
-    doc = read_sfx(find_shot(f'{DATA}/MAT_0130_L1_C002_260809_v001').sfx).element(['Red Matte'])
+    doc = read_sfx(find_shot(f'{DATA}/MAT_0130_L1_C002_260809_v001').sfx).layer(['Red Matte'])
     soft = render(doc, 10, RenderConfig(supersample=2), scale=0.3)
     hard = render(doc, 10, RenderConfig(supersample=1), scale=0.3)
     fractional = ((soft > 0.01) & (soft < 0.99)).sum()
@@ -143,7 +132,7 @@ def test_supersampling_is_on_by_default_and_produces_soft_edges():
 
 
 def test_soft_iou_sees_the_edge_error_that_thresholded_iou_hides():
-    """The measured case from the handoff: Silhouette's edge reads 0.00 -> 0.88 -> 1.00
+    """Silhouette's edge reads 0.00 -> 0.88 -> 1.00
     across a row; a hard render gives 0.00 -> 1.00 -> 1.00. Both agree once thresholded at
     0.5, so thresholded IoU calls the hard render perfect. soft-IoU does not."""
     truth = np.array([[0.0, 0.88, 1.0]])
@@ -151,7 +140,6 @@ def test_soft_iou_sees_the_edge_error_that_thresholded_iou_hides():
     hard = np.array([[0.0, 1.00, 1.0]])
 
     assert iou(hard, truth) == iou(soft, truth) == 1.0      # threshold hides it
-    assert dice(hard, truth) == 1.0
     assert soft_iou(soft, truth) == 1.0                     # soft-IoU does not
     assert soft_iou(hard, truth) == pytest.approx(1.88 / 2.0)
 
@@ -164,12 +152,11 @@ def test_soft_iou_edge_cases():
 
 # ---- layer -> channel matching -------------------------------------------------
 
-def test_candidates_include_nested_layers_labelled_by_path():
+def test_top_layers_are_the_documents_roots():
     doc = read_sfx(find_shot(f'{DATA}/nfl_0200_bg01_v001_compplate_roto_v001').sfx)
-    labels = [c.label for c in candidate_layers(doc, max_depth=2)]
-    assert 'green' in labels and 'blue' in labels
-    assert any('/' in l for l in labels), 'no nested candidates found'
-    assert all(not l.startswith('/') for l in labels)
+    refs = top_layers(doc)
+    assert [r.name for r in refs] == [root.name for root in doc.roots] == ['blue', 'green']
+    assert all(r.ancestors == () for r in refs)
 
 
 def test_isolate_rebuilds_the_ancestor_chain_so_transforms_still_compose():
@@ -208,23 +195,6 @@ def test_tracked_layers_are_always_leaves():
                 assert not nested, (shot.name, layer.name, [n.name for n in nested])
 
 
-def test_matcher_recovers_the_known_nfl_0200_mapping():
-    shot = find_shot(f'{DATA}/nfl_0200_bg01_v001_compplate_roto_v001')
-    doc = read_sfx(shot.sfx)
-    found = {(a.matte, a.channel): a for a in
-             assign_channels(doc, shot.mattes, scale=0.25,
-                             sample_frames=shot.sample_frames(2))}
-    assert set(found) == {('matte01', 'R'), ('matte01', 'G')}
-    # R is the person+chair element, delivered from the top-level 'blue' layer.
-    assert found[('matte01', 'R')].label == 'blue'
-    assert found[('matte01', 'R')].score > 0.95
-    # G is the hair-detail element, which lives under 'green'.
-    assert found[('matte01', 'G')].label.startswith('green')
-    assert found[('matte01', 'G')].score > 0.90
-
-
-# ---- lifespan classification ---------------------------------------------------
-
 def test_shape_class_splits_the_four_training_populations():
     def sh(**kw):
         return Shape(name='s', path=[Key(0, 'linear', np.zeros((4, 1, 2)))], **kw)
@@ -241,7 +211,7 @@ def test_shape_class_splits_the_four_training_populations():
 
 def test_ephemeral_counts_match_the_measured_archive():
     """The 51%-of-shapes-are-single-frame finding, as a regression test: it is the reason
-    ephemeral shapes are excluded from POC targets (POC.md 3)."""
+    ephemeral shapes exist and are counted."""
     counts = {s.name: read_sfx(s.sfx, validate=False).stats() for s in find_shots(DATA)}
     total = sum(v['shapes'] for v in counts.values())
     ephemeral = sum(v['ephemeral'] for v in counts.values())

@@ -1,4 +1,4 @@
-"""Element -> tensors the network trains on.
+"""RotoLayer -> tensors the network trains on.
 
 Targets are the *dense per-frame* control points, not the artist's key values. The network
 predicts geometry frame by frame; choosing which of those frames become keys is the DP's job
@@ -31,9 +31,9 @@ from ..sfx.json_ir import from_json_ir
 
 
 @dataclass
-class ElementData:
-    """One element, fully materialised. Dense tracks dominate memory; ~200 MB for all 13."""
-    element_id: str
+class LayerData:
+    """One layer, fully materialised. Dense tracks dominate memory; ~200 MB for all 13."""
+    layer_id: str
     directory: Path
     frames: np.ndarray          # (F,)
     points: np.ndarray          # (F, S, Pmax, Cmax, 2) float32, [0,1] across the crop
@@ -65,7 +65,7 @@ class ElementData:
     def alphas(self) -> np.ndarray:
         """(F, 256, 256) float32, materialised on first use and kept.
 
-        All 13 elements at once is ~475 MB, which fits, but the read is slow enough that the
+        All 13 layers at once is ~475 MB, which fits, but the read is slow enough that the
         training loop must not pay it per step.
         """
         if self._alphas is None:
@@ -85,7 +85,7 @@ def _group_index(mats: np.ndarray) -> tuple[np.ndarray, int]:
     return idx, len(keys)
 
 
-def load_element(directory: str | Path) -> ElementData:
+def load_element(directory: str | Path) -> LayerData:
     d = Path(directory)
     meta = json.loads((d / 'meta.json').read_text())
     doc = from_json_ir(json.loads((d / 'target_ir.json').read_text()))
@@ -135,13 +135,13 @@ def load_element(directory: str | Path) -> ElementData:
         src = mats[int(np.where(group_of == g)[0][0])]
         affine[:, g] = affine_from_matrix(src[[pos[int(f)] for f in frames]]).astype(np.float32)
 
-    return ElementData(meta['element']['element_id'], d, frames, points, local, live, affine,
+    return LayerData(meta['layer']['layer_id'], d, frames, points, local, live, affine,
                        group_of, desc, pmask, float(crop['px_per_norm']), matrices,
                        {'width': source['width'], 'height': source['height'],
                         'scale': crop['scale'], 'out_px': out_px, 'offsets': offsets},
                        out_px)
 
 
-def load_dataset(root: str | Path) -> list[ElementData]:
+def load_dataset(root: str | Path) -> list[LayerData]:
     return [load_element(p) for p in sorted(Path(root).iterdir())
             if (p / 'meta.json').exists()]

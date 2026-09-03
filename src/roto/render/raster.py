@@ -32,8 +32,8 @@ STROKE_WIDTH_GAIN = 0.0625
 """``px_width = strokeWidth * height * GAIN``.
 
 Empirically calibrated, not derived: ``width * height`` overestimates by ~16x on
-TVC_sh0230 (0.039 -> 50px, where ~2-3px matches the delivered hair matte). The handoff doc
-reports the same 0.0625; ``roto_toolkit.py`` had it left at 1.0, which is why its stroke
+TVC_sh0230 (0.039 -> 50px, where ~2-3px matches the hair the artist drew). A gain of 1.0
+would put strokes at roughly 16x their real width, which is why an unscaled stroke
 renders came out hairline. Still a knob, not a claim, until we can diff against
 Silhouette's own renderer.
 """
@@ -53,7 +53,7 @@ class RenderConfig:
     Silhouette writes a grey anti-aliased edge; a hard 0/1 render disagrees with it on
     every boundary pixel, which is the entire residual in the round-trip numbers. Keeping
     the soft values is what makes ``soft_iou`` meaningful, so this defaults to 2 (the
-    handoff's setting) rather than 1. Memory cost is ss^2 x the frame.
+    measured setting) rather than 1. Memory cost is ss^2 x the frame.
     """
     stroke_px: Callable[[float, int], float] = default_stroke_px
     fill_open_zero_width: bool = True
@@ -154,7 +154,7 @@ def render(doc: RotoDoc, frame: float, cfg: RenderConfig | None = None,
     ``crop`` is ``(x0, y0, w, h)`` in *source* pixels; the output is ``(h*scale, w*scale)``
     covering just that window. Rendering a 512px crop of a 2880x1978 frame directly, rather
     than rendering the full frame and slicing, is what makes high supersampling affordable
-    where it matters. The crop box may extend outside the source frame -- the element stays
+    where it matters. The crop box may extend outside the source frame -- the layer stays
     centred and the region outside simply renders empty.
     """
     cfg = cfg or RenderConfig()
@@ -199,7 +199,7 @@ def render(doc: RotoDoc, frame: float, cfg: RenderConfig | None = None,
 
         # Work inside the shape's own bounding box. A full-canvas scratch buffer costs a
         # 16MB memset per shape at a 512 crop with supersample 4, which dominated render
-        # time for shape-dense elements. An inverted shape covers everything outside itself,
+        # time for shape-dense layers. An inverted shape covers everything outside itself,
         # so it is the one case that still needs the whole canvas.
         if shape.invert:
             x0i, y0i, x1i, y1i = 0, 0, W, H
@@ -240,7 +240,7 @@ def render_union(doc: RotoDoc, frame: float, cfg: RenderConfig | None = None,
                  scale: float = 1.0, crop: Sequence[float] | None = None) -> np.ndarray:
     """Render each root separately and take the per-pixel maximum.
 
-    A delivered matte channel is the *union* of several top-level layers, and union is not
+    A layer's matte is the *union* of its shapes, and union is not
     the same as this renderer's add-and-clip: adding two overlapping soft edges overshoots,
     and a Subtract in one root must not punch a hole in another. Every layer->channel
     comparison in the codebase uses this rule, so it lives here rather than being restated.

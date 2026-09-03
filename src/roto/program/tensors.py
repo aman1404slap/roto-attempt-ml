@@ -1,27 +1,26 @@
-"""The model's target: an element's spline program as dense arrays, and back again.
+"""A layer's spline program as dense arrays, and back again.
 
-Phase 1 exists to prove this file is right. If the artist program cannot survive a trip
-through these arrays, no model trained on them can reproduce it, and every later measurement
-would be measuring the representation's ceiling rather than the model. So the gate is:
-``decode(encode(program))`` must render bit-comparably to the packet's own alpha.
+``decode(encode(program))`` must render to the same pixels as the layer's own matte. If the
+artist's program cannot survive that trip, no model trained on these arrays could reproduce
+it, and every later measurement would be reporting the representation's ceiling rather than
+the model's skill. That round trip is an automated test.
 
-Four measured facts shape the representation, all verified on the nine Phase 0 packets:
+Four measured facts shape the representation:
 
 * **Layer transforms are affine, never perspective** -- row 2 is always ``[0,0,1,0]`` and
   column 3 always ``[0,0,0,1]``. So a track is 6 numbers per frame, not 16. Similarity
-  (rotation + uniform scale) covers 7 of 9 elements but *not* ``TVC_sh0260`` or
-  ``nfl_0080``, which carry shear -- so the head must be full affine, not 4-DOF.
-* **Transforms are shared per shape group, not per shape.** 1310 shapes across the nine
-  packets resolve to **64 distinct tracks** -- ``nfl_0200`` alone is 75 shapes over 3 tracks.
-  Predicting per shape would be a 20x redundant target and would let the model disagree
-  with itself about the motion of one rigid group.
-* **Opacity is strictly binary.** Not one of the 1310 shapes ever takes a value between 0
-  and 100, so a per-frame live mask is a *lossless* encoding of the lifespan, not an
-  approximation of a fade.
-* **0.8% of path keys sit outside the rendered frame range** (a key at frame -1, say). A
-  key mask spanning only the packet's frames would silently drop them, and dropping a key
-  changes how every frame up to the next key interpolates. Hence ``key_axis``, which spans
-  every key present, while ``frames`` stays the rendered range.
+  (rotation + uniform scale) covers most layers but not all: two carry shear, so the head must
+  be full affine, not 4-DOF.
+* **Transforms are shared per shape group, not per shape.** The 2753 shapes in this archive
+  resolve to 208 distinct tracks. Predicting per shape would be a redundant target and would
+  let the model disagree with itself about the motion of one rigid group.
+* **Shape opacity is strictly binary.** No shape ever takes a value between 0 and 100, so a
+  per-frame live mask is a *lossless* encoding of when a shape exists, not an approximation of
+  a fade.
+* **A few keyframes sit outside the rendered frame range** (a key at frame -1, say). A key mask
+  spanning only the rendered frames would silently drop them, and dropping a key changes how
+  every frame up to the next one interpolates. Hence ``key_axis``, which spans every key
+  present, while ``frames`` stays the rendered range.
 """
 from __future__ import annotations
 
@@ -40,7 +39,7 @@ AFFINE_DOF = 6
 
 
 def affine_from_matrix(m: np.ndarray) -> np.ndarray:
-    """(..., 4, 4) -> (..., 6). Discards entries measured to be constant on all packets."""
+    """(..., 4, 4) -> (..., 6). Discards entries measured to be constant on all samples."""
     m = np.asarray(m)
     return np.stack([m[..., 0, 0], m[..., 0, 1], m[..., 1, 0], m[..., 1, 1],
                      m[..., 3, 0], m[..., 3, 1]], axis=-1)
@@ -62,9 +61,9 @@ def matrix_from_affine(a: np.ndarray) -> np.ndarray:
 class ProgramSpec:
     """What the model is *given* in the teacher-forced setting: the breakdown, not the values.
 
-    Everything here comes straight from the artist's IR and is never predicted in Phase 1/2.
+    Everything here comes straight from the artist's IR and is never predicted.
     """
-    element_id: str
+    layer_id: str
     frames: np.ndarray            # (T,)   rendered frames, matching alpha/
     key_axis: np.ndarray          # (Tk,)  frame axis for key/live masks; spans every key
     n_points: np.ndarray          # (S,)   control points per shape
@@ -90,7 +89,7 @@ class ProgramSpec:
         return int(self.coords_per_point.max()) if self.n_shapes else 1
 
     def padded_floats(self) -> int:
-        """Element count of the padded point tensor -- large elements are worth checking."""
+        """RotoLayer count of the padded point tensor -- large layers are worth checking."""
         return (self.n_shapes * self.max_keys * self.max_points * self.max_coords * 2)
 
 
@@ -133,9 +132,9 @@ def _group_transforms(mats: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
     return np.stack(tracks), index
 
 
-def load_program(packet_dir: str | Path) -> tuple[ProgramSpec, ProgramTensors, dict[str, Any]]:
-    """Read a Phase 0 packet into ``(spec, tensors, meta)``."""
-    d = Path(packet_dir)
+def load_program(layer_dir: str | Path) -> tuple[ProgramSpec, ProgramTensors, dict[str, Any]]:
+    """Read one layer sample into ``(spec, tensors, meta)``."""
+    d = Path(layer_dir)
     meta = json.loads((d / 'meta.json').read_text())
     t = np.load(d / 'tensors.npz')
     n = int(t['n_shapes'])
@@ -150,7 +149,7 @@ def load_program(packet_dir: str | Path) -> tuple[ProgramSpec, ProgramTensors, d
     # Transform tracks are sampled densely over `matrix_frames`; extend to the key axis by
     # holding the end values, which is what the renderer's own sampling does outside a
     # keyed range. `matrix_frames` is dense even when alpha was emitted on a stride, so
-    # the result lines up with `key_axis` element for element -- asserted, because a short
+    # the result lines up with `key_axis` layer for layer -- asserted, because a short
     # track reads out of range at decode time rather than producing a wrong number.
     mframes = t['matrix_frames'].astype(np.int32) if 'matrix_frames' in t else frames
     mats = []
@@ -168,7 +167,7 @@ def load_program(packet_dir: str | Path) -> tuple[ProgramSpec, ProgramTensors, d
 
     index = {s['i']: s for s in meta['shapes']}
     spec = ProgramSpec(
-        element_id=meta['element']['element_id'], frames=frames, key_axis=key_axis,
+        layer_id=meta['layer']['layer_id'], frames=frames, key_axis=key_axis,
         n_points=np.array([index[i]['n_points'] for i in range(n)], np.int32),
         coords_per_point=np.array([index[i]['coords_per_point'] for i in range(n)], np.int32),
         n_keys=np.array([len(k) for k in per_keys], np.int32),
@@ -203,11 +202,11 @@ def load_program(packet_dir: str | Path) -> tuple[ProgramSpec, ProgramTensors, d
     return spec, tensors, meta
 
 
-def _interp_of(packet_dir: Path, shape_index: int) -> list[str]:
+def _interp_of(layer_dir: Path, shape_index: int) -> list[str]:
     """Per-key interpolation modes, read from target_ir.json in document order."""
-    cache = _INTERP_CACHE.get(packet_dir)
+    cache = _INTERP_CACHE.get(layer_dir)
     if cache is None:
-        ir = json.loads((packet_dir / 'target_ir.json').read_text())
+        ir = json.loads((layer_dir / 'target_ir.json').read_text())
 
         def walk(layer):
             for s in layer['shapes']:
@@ -217,23 +216,23 @@ def _interp_of(packet_dir: Path, shape_index: int) -> list[str]:
 
         cache = [[k[1] for k in s['path_keys']]
                  for l in ir['layers'] for s in walk(l)]
-        _INTERP_CACHE[packet_dir] = cache
+        _INTERP_CACHE[layer_dir] = cache
     return cache[shape_index]
 
 
 _INTERP_CACHE: dict[Path, list[list[str]]] = {}
 
 
-def decode(packet_dir: str | Path, spec: ProgramSpec, pred: ProgramTensors) -> RotoDoc:
+def decode(layer_dir: str | Path, spec: ProgramSpec, pred: ProgramTensors) -> RotoDoc:
     """Rebuild a renderable ``RotoDoc`` from predicted tensors.
 
-    The *structure* comes from the packet's ``target_ir.json`` -- that is what teacher-forcing
+    The *structure* comes from the sample's ``target_ir.json`` -- that is what teacher-forcing
     means -- and everything the model predicts is overwritten: each shape's key frames and
     control points, its lifespan, and its group's transform track. Transform tracks are
     written densely, one key per frame, which is lossless because the renderer only ever
     samples integer frames.
     """
-    d = Path(packet_dir)
+    d = Path(layer_dir)
     doc = read_json_ir(d / 'target_ir.json')
     axis = spec.key_axis
     mats = matrix_from_affine(pred.affine)                  # (G, Tk, 4, 4)

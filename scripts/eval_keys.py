@@ -1,9 +1,11 @@
-"""Phase 3: how well does curve simplification recover the artist's keyframes?
+"""How well does curve simplification recover the artist's keyframes?
 
-No model is involved. Each shape's control-point track is reconstructed densely from the
-artist's own path keys, the DP is asked for the fewest knots reproducing it within a pixel
-tolerance, and the result is scored against the keys the artist actually set. This is the
-cheapest honest read on the half of the problem that is not solved.
+No model is involved. Each shape's control-point track is rebuilt densely from the artist's own
+keys, the search is asked for the fewest keyframes reproducing it within a pixel tolerance, and
+the result is scored against the keys the artist actually set.
+
+This measures the keyframe stage on its own, against ground-truth motion. The operating point
+for real use is chosen separately, on *predicted* tracks -- see roto.model.reconstruct.
 """
 from __future__ import annotations
 
@@ -26,9 +28,9 @@ def shapes_of(doc):
         yield shape
 
 
-def evaluate(element_dir: Path, tol_px: float, match_tol: int) -> dict:
-    meta = json.loads((element_dir / 'meta.json').read_text())
-    doc = from_json_ir(json.loads((element_dir / "target_ir.json").read_text()))
+def evaluate(layer_dir: Path, tol_px: float, match_tol: int) -> dict:
+    meta = json.loads((layer_dir / 'meta.json').read_text())
+    doc = from_json_ir(json.loads((layer_dir / "target_ir.json").read_text()))
     px = meta['crop']['px_per_norm']
     frames = np.asarray(meta['frames']['index'], dtype=np.int32)
 
@@ -51,7 +53,7 @@ def evaluate(element_dir: Path, tol_px: float, match_tol: int) -> dict:
     w = np.array([r['n_truth'] for r in rows], dtype=np.float64)
     w = w / w.sum()
     return {
-        'element': element_dir.name,
+        'layer': layer_dir.name,
         'shapes': len(rows),
         'artist_keys': int(sum(r['n_truth'] for r in rows)),
         'predicted_keys': int(sum(r['n_pred'] for r in rows)),
@@ -80,7 +82,7 @@ def main() -> None:
         tk = sum(r['artist_keys'] for r in rows)
         pk = sum(r['predicted_keys'] for r in rows)
         agg = {
-            'tol_px': tol, 'elements': len(rows), 'artist_keys': tk, 'predicted_keys': pk,
+            'tol_px': tol, 'layers': len(rows), 'artist_keys': tk, 'predicted_keys': pk,
             'key_ratio': pk / max(1, tk),
             'precision': float(np.average([r['precision'] for r in rows],
                                           weights=[r['artist_keys'] for r in rows])),
@@ -88,7 +90,7 @@ def main() -> None:
                                        weights=[r['artist_keys'] for r in rows])),
             'f1': float(np.average([r['f1'] for r in rows],
                                    weights=[r['artist_keys'] for r in rows])),
-            'per_element': rows,
+            'per_layer': rows,
         }
         out.append(agg)
         print(f'tol {tol:>4.1f}px   keys {pk:>6} vs {tk:>6} artist (x{agg["key_ratio"]:.2f})   '

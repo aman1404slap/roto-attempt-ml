@@ -1,27 +1,26 @@
-"""Keyframe selection as curve simplification, not per-frame classification.
+"""Choosing keyframes by curve simplification.
 
-The measured failure of the earlier approach was precision 0.21-0.44 at recall 0.75-1.00 --
-the keys were found, and then roughly 2.5x too many frames were keyed besides. That is not a
-tuning problem, it is the wrong problem statement. A per-frame binary head decides "is this a
-key" independently for each frame, but an artist's keys are a *jointly optimal sparse set*:
-key 30 is only worth spending because keys 10 and 50 leave frame 30 badly interpolated. No
-independent per-frame decision can express that, so the head fires wherever the picture moves
-and precision collapses.
+A shape's control points move over time. The artist stores that motion as a handful of
+**keyframes** and lets Silhouette interpolate between them. To write a usable ``.sfx`` we have
+to make the same choice: given the motion, which frames should carry a key?
 
-Restated as curve simplification the problem is exact and needs no training. Given a shape's
-control-point track over time, choose the fewest knots such that interpolating between them
-reproduces the track within a tolerance. That is the same decision the artist made at the
-desk, and it is solvable optimally.
+Keying every frame is technically correct and practically useless -- an artist opening a file
+with a key on every frame of every shape is worse off than starting from nothing. So the
+question is the fewest keyframes whose interpolation still reproduces the motion within a
+tolerance.
 
-``select`` runs a minimax dynamic program: ``dp[k][b]`` is the smallest achievable worst-case
-segment error for a k-knot path ending at frame ``b``, composed with ``max`` rather than ``+``
-because a keyframe set is judged by its worst frame, not its average one. The result is the
-provably smallest knot set meeting the tolerance -- there is no threshold to tune except the
-tolerance itself, which is in pixels and therefore means something.
+Stated that way it is curve simplification, and it has an exact answer. There is nothing to
+train and one setting to choose: a tolerance, in pixels.
 
-The interpolation must match the renderer's, which interpolates *linearly between adjacent
-path keys* in local normalised coordinates. Anything else would select knots that are optimal
-for a curve nobody draws.
+``select`` runs a minimax dynamic program below ``DP_MAX_FRAMES``. ``dp[k][b]`` is the smallest
+achievable worst-case segment error for a k-knot path ending at frame ``b``, composed with
+``max`` rather than ``+`` because a keyframe set is judged by its worst frame, not its average
+one. Above that span the cost matrix is cubic in the number of frames, so furthest-reach takes
+over and ``Selection.method`` records which ran.
+
+The interpolation used here must match the renderer's, which interpolates **linearly between
+adjacent keys** in local normalised coordinates. Anything else would choose keys that are
+optimal for a curve nobody draws.
 """
 from __future__ import annotations
 
@@ -33,8 +32,8 @@ DP_MAX_FRAMES = 64
 """Above this live span the exact DP is replaced by furthest-reach.
 
 The DP needs a full segment-cost matrix: O(T^2) segments each scored over O(T P) samples, so
-it is cubic in the live span and quartic-ish once every shape in an element pays it. Measured
-on this archive that is minutes per element at T=91, which is not a tradeoff worth making for
+it is cubic in the live span and quartic-ish once every shape in an layer pays it. Measured
+on this archive that is minutes per layer at T=91, which is not a tradeoff worth making for
 a tolerance-driven objective. Below 64 frames it is cheap and exact, so it runs.
 """
 
@@ -147,7 +146,7 @@ def _dp(track: np.ndarray, tol: float) -> list[int]:
 def select(track: np.ndarray, frames: np.ndarray, tol: float) -> Selection:
     """Fewest knots whose linear interpolation stays within ``tol`` of ``track``.
 
-    ``track`` is ``(T, P, 2)`` in whatever units ``tol`` is stated in -- packet pixels, in
+    ``track`` is ``(T, P, 2)`` in whatever units ``tol`` is stated in -- crop pixels, in
     this project, so the tolerance is a distance an artist could be shown.
     """
     T = len(frames)

@@ -1,4 +1,4 @@
-"""Model output -> a real spline program -> pixels, scored against the element's own alpha.
+"""Model output -> a real spline program -> pixels, scored against the layer's own alpha.
 
 This is the step that decides whether v1 worked, and it is deliberately the strictest reading
 available. The network's per-frame geometry is converted back to local coordinates, the
@@ -26,18 +26,18 @@ import numpy as np
 import torch
 
 from ..dataset import load_alpha
-from ..eval.metrics import iou, soft_iou
+from ..metrics import iou, soft_iou
 from ..ir import Key, RotoDoc, Shape
 from ..keys import f1 as key_f1
 from ..keys import select
 from ..render.raster import RenderConfig, render_union
 from ..sfx.json_ir import from_json_ir
-from .data import ElementData, load_element
+from .data import LayerData, load_element
 from .geometry import crop_to_local
 from .net import RotoNet
 
 DEFAULT_TOL_PX = 1.0
-"""Keyframe tolerance, in packet pixels.
+"""Keyframe tolerance, in crop pixels.
 
 On *ground-truth* tracks the best tolerance is 0.1 px (F1 0.766). On *predicted* tracks that
 value is badly wrong, and the reason is worth stating because it couples two components that
@@ -45,14 +45,13 @@ look independent: the keyframe search cannot be tuned below the geometry's own n
 
 A predicted track carries a per-frame jitter of roughly the model's point error. Asked to
 reproduce that track within 0.1 px, the search must key almost every frame, because the noise
-alone exceeds the tolerance -- measured at **16.5x the artist's key count, F1 0.115**, which is
-worse over-keying than the learned head it replaced. The tolerance has to sit above the noise,
-not above the artist's own precision.
+alone exceeds the tolerance -- measured at **16.5x the artist's key count**. The tolerance has
+to sit above the model's noise, not above the artist's own precision.
 
 So the operating point is chosen against predicted tracks, not ground-truth ones. Measured
-sweep over three elements spanning the quality range (``results/keyframe_operating_point_sweep.txt``):
+sweep over three layers spanning the quality range (``results/keyframe_operating_point_sweep.txt``):
 1.0 px with a 9-frame smoothing window gives the best rendered IoU of every combination tried,
-at 0.99x the artist's key count on the best-fit element."""
+at 0.99x the artist's key count on the best-fit layer."""
 
 SMOOTH_WINDOW = 9
 """Frames of temporal smoothing applied to a predicted track before knots are chosen.
@@ -62,7 +61,7 @@ approximately independent frame to frame. A short centred average therefore remo
 part of the noise while leaving genuine motion almost untouched, which lets the search see the
 structure it is meant to find. Set to 1 to disable.
 
-Measured, at 1.0 px tolerance: turning smoothing on raises rendered soft-IoU on every element
+Measured, at 1.0 px tolerance: turning smoothing on raises rendered soft-IoU on every layer
 tried (0.9820 -> 0.9846, 0.9605 -> 0.9653, 0.7651 -> 0.7763) *and* cuts the key count from
 3.01x the artist's to 0.99x. Both improve together because the keys it removes were spent
 tracking noise, not motion."""
@@ -70,7 +69,7 @@ tracking noise, not motion."""
 
 @dataclass(slots=True)
 class Reconstruction:
-    element_id: str
+    layer_id: str
     doc: RotoDoc
     frames: np.ndarray
     soft_iou: np.ndarray
@@ -84,7 +83,7 @@ class Reconstruction:
 
     def summary(self) -> dict[str, Any]:
         return {
-            'element_id': self.element_id,
+            'layer_id': self.layer_id,
             'frames': int(len(self.frames)),
             'mean_soft_iou': float(self.soft_iou.mean()),
             'min_soft_iou': float(self.soft_iou.min()),
@@ -109,11 +108,11 @@ def load_model(checkpoint: str | Path) -> tuple[RotoNet, dict[str, Any]]:
 
 
 @torch.no_grad()
-def predict_crop_points(net: RotoNet, el: ElementData, shape_base: int = 0,
+def predict_crop_points(net: RotoNet, el: LayerData, shape_base: int = 0,
                         group_base: int = 0, batch: int = 8) -> np.ndarray:
     """(F, S, Pmax, Cmax, 2) predicted control points, in crop space.
 
-    ``shape_base``/``group_base`` are the element's offsets into the query tables and must
+    ``shape_base``/``group_base`` are the layer's offsets into the query tables and must
     match training exactly; they come from the checkpoint.
     """
     out = np.zeros_like(el.points)
@@ -130,7 +129,7 @@ def predict_crop_points(net: RotoNet, el: ElementData, shape_base: int = 0,
     return out
 
 
-def to_local(el: ElementData, crop_pts: np.ndarray) -> np.ndarray:
+def to_local(el: LayerData, crop_pts: np.ndarray) -> np.ndarray:
     """Crop-space predictions -> IR-native local normalised coordinates."""
     out = np.zeros_like(crop_pts)
     c = el.crop
@@ -162,14 +161,14 @@ def smooth_track(track: np.ndarray, window: int) -> np.ndarray:
     return out.reshape(track.shape)
 
 
-def rebuild(el: ElementData, local_pts: np.ndarray, tol_px: float,
+def rebuild(el: LayerData, local_pts: np.ndarray, tol_px: float,
             smooth: int = SMOOTH_WINDOW) -> tuple[RotoDoc, dict[str, Any]]:
     """Choose keys per shape and write a document carrying only those keys.
 
     The keyframe search runs on the point positions only, not on Bezier handles. Handles are
     carried at whatever the chosen keys hold: they describe the curve *between* points, so
     letting them drive key timing would key on tangent wobble the picture barely shows. Two of
-    thirteen elements have handles at all.
+    thirteen layers have handles at all.
 
     Key scoring reads the artist's keys from a second, untouched copy of the IR, so the
     comparison is never the rebuilt document against itself.
@@ -226,10 +225,10 @@ def rebuild(el: ElementData, local_pts: np.ndarray, tol_px: float,
     return doc, stats
 
 
-def reconstruct(element_dir: str | Path, net: RotoNet, tol_px: float = DEFAULT_TOL_PX,
+def reconstruct(layer_dir: str | Path, net: RotoNet, tol_px: float = DEFAULT_TOL_PX,
                 frames: Sequence[int] | None = None, shape_base: int = 0,
                 group_base: int = 0, smooth: int = SMOOTH_WINDOW) -> Reconstruction:
-    el = load_element(element_dir)
+    el = load_element(layer_dir)
     crop_pts = predict_crop_points(net, el, shape_base, group_base)
 
     mask = el.point_mask[None] & el.live[..., None, None]
@@ -253,5 +252,5 @@ def reconstruct(element_dir: str | Path, net: RotoNet, tol_px: float = DEFAULT_T
         softs.append(soft_iou(pred, truth))
         hards.append(iou(pred, truth))
 
-    return Reconstruction(el.element_id, doc, np.asarray(want), np.asarray(softs),
+    return Reconstruction(el.layer_id, doc, np.asarray(want), np.asarray(softs),
                           np.asarray(hards), point_err, **kstats)

@@ -1,18 +1,13 @@
-"""``roto_ir.json`` -- the on-disk IR, wire-compatible with ``roto_toolkit.py``.
+"""``roto_ir.json`` -- the IR on disk, in a readable form.
 
-The toolkit's JSON schema is the agreed hand-off contract, so we emit exactly it: same key
-names, same nesting, keyed values as strings the way ``eval_scalar``/``eval_trs_matrix``
-expect them. Anything we add beyond the toolkit is a *new* key, never a changed one, so a
-toolkit-shaped reader ignores it.
+Two things a flat schema loses, and how this one keeps them:
 
-Two things the toolkit schema loses, and how we keep them:
-
-* **Interleaved order.** The toolkit splits a layer's children into separate ``shapes`` and
-  ``children`` lists, so the original document order between them is gone. Order is the
-  teacher-forcing sequence for the model, so we also write ``order``, and use it on read.
-* **Per-key interpolation on matrices.** Toolkit matrix keys are ``[frame, values]`` with no
-  interp slot and are read back as linear. We keep that format for compatibility and record
-  any non-linear matrix interp in ``matrix_interp``.
+* **Interleaved order.** A layer's children are split into separate ``shapes`` and ``children``
+  lists, which loses the order they were authored in. Silhouette composites in document order,
+  so a Subtract shape that sat between two others must stay between them. ``child_order``
+  records the original sequence.
+* **Per-key interpolation.** Interpolation is stored per key, never per track, because the
+  archive mixes linear and catmullrom within a single shape.
 """
 from __future__ import annotations
 
@@ -34,7 +29,7 @@ SCHEMA_VERSION = 1
 # ---- scalar / vector tracks ----------------------------------------------------
 
 def _fmt(value: Any) -> str:
-    """Keyed values are strings in the toolkit schema: scalars bare, vectors parenthesised."""
+    """Keyed values are strings: scalars bare, vectors parenthesised."""
     v = np.ravel(np.asarray(value, dtype=np.float64))
     if v.size == 1:
         return repr(float(v[0]))
@@ -103,7 +98,7 @@ def _shape_out(shape: Shape) -> dict[str, Any]:
         'strokeWidth': {'const': repr(float(shape.stroke_width))},
         'mode': shape.blend,
         'invert': shape.invert,
-        # --- beyond the toolkit schema ---
+        # --- structure a flat schema would lose ---
         'feather': _track_out(shape.feather),
         'shape_class': shape_class(shape),
     }
@@ -145,7 +140,7 @@ def _layer_out(layer: Layer) -> dict[str, Any]:
         'trs': {name: _track_out(track) for name, track in layer.trs.items()},
         'shapes': shapes,
         'children': children,
-        # --- beyond the toolkit schema ---
+        # --- structure a flat schema would lose ---
         'order': order,
         'opacity': _track_out(layer.opacity),
         'mode': layer.blend,
@@ -162,7 +157,7 @@ def _layer_in(obj: dict[str, Any]) -> Layer:
         seq: list[Layer | Shape] = [shapes[i] if kind == 'shape' else children[i]
                                     for kind, i in order]
     else:
-        seq = [*shapes, *children]      # toolkit-written file: order was not recorded
+        seq = [*shapes, *children]      # no child_order recorded: fall back to document order
     return Layer(
         name=obj.get('label', ''),
         transform=_matrix_in(obj.get('matrix'), obj.get('matrix_interp')),
@@ -189,7 +184,7 @@ def to_json_ir(doc: RotoDoc) -> dict[str, Any]:
             'frameRate': doc.frame_rate,
         },
         'layers': [_layer_out(r) for r in doc.roots],
-        # --- beyond the toolkit schema ---
+        # --- structure a flat schema would lose ---
         'schema_version': SCHEMA_VERSION,
         'dialect': doc.dialect,
         'source_label': doc.source_label,

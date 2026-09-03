@@ -2,7 +2,7 @@
 
 This module is the project's contract: every reader, writer, renderer and model target
 converts to or from these types. Design choices here are forced by measurements on the
-Hotspring sample -- see FINDINGS.md. In particular:
+archive. In particular:
 
 * ``interp`` is stored **per key**, never globally. The archive is ~75% linear and ~25%
   catmullrom, and it varies by shot, so a global assumption silently corrupts every
@@ -156,12 +156,12 @@ class RotoDoc:
             if isinstance(n, Layer):
                 yield anc, n
 
-    def element(self, names: str | Sequence[str]) -> RotoDoc:
+    def layer(self, names: str | Sequence[str]) -> RotoDoc:
         """A shallow view containing only the named top-level layer(s).
 
-        The reference doc's unit of inference is the *element*, not the shot: a shot can
-        hold 1600 shapes while one element is tens. Several top-level layers can feed one
-        delivered matte channel, so this accepts a list.
+        The reference doc's unit of inference is the *layer*, not the shot: a shot can
+        hold 1600 shapes while one layer is tens. Several top-level layers can feed one
+        matte, so this accepts a list.
         """
         wanted = [names] if isinstance(names, str) else list(names)
         picked = [r for r in self.roots if r.name in wanted]
@@ -252,7 +252,7 @@ def sample(keys: Sequence[Key], frame: float) -> Any:
 #
 # They must be separable from persistent shapes as a *field*, not a training-time filter:
 # mixed into a keyframe-timing loss they teach "key every frame", which is the exact
-# failure this project exists to prevent. See POC.md 4.4.
+# failure this project exists to prevent.
 
 EPHEMERAL_MAX_FRAMES = 2
 
