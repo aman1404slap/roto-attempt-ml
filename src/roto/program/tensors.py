@@ -7,10 +7,12 @@ the model's skill. That round trip is an automated test.
 
 Four measured facts shape the representation:
 
-* **Layer transforms are affine, never perspective** -- row 2 is always ``[0,0,1,0]`` and
-  column 3 always ``[0,0,0,1]``. So a track is 6 numbers per frame, not 16. Similarity
-  (rotation + uniform scale) covers most layers but not all: two carry shear, so the head must
-  be full affine, not 4-DOF.
+* **Layer transforms are projective, not affine** -- row 2 and column 2 are always
+  ``[0,0,1,0]``, but column 3 is *not* always ``[0,0,0,1]``. So a track is 8 numbers per frame
+  (a normalised 2D homography), not 6 and not 16. Similarity covers most layers but not all:
+  two carry shear and two carry perspective. See :func:`proj_from_matrix` -- the 6-number
+  affine form this module shipped with is measured to be lossy on those two layers, by 23.8
+  crop px at worst, and is kept only so v1's numbers reproduce.
 * **Transforms are shared per shape group, not per shape.** The 2753 shapes in this archive
   resolve to 208 distinct tracks. Predicting per shape would be a redundant target and would
   let the model disagree with itself about the motion of one rigid group.
@@ -35,14 +37,81 @@ from ..ir import Key, Layer, RotoDoc, Shape
 from ..sfx.json_ir import read_json_ir
 
 AFFINE_DOF = 6
-"""``(m00, m01, m10, m11, tx, ty)`` -- the entries of a 4x4 row-vector matrix that vary."""
+"""``(m00, m01, m10, m11, tx, ty)`` -- v1's transform target. **Measured lossy; see below.**"""
+
+PROJ_DOF = 8
+"""``(m00, m01, m02w, m10, m11, m12w, tx, ty)`` -- a normalised 2D homography.
+
+The entries of a 4x4 row-vector layer matrix that actually vary, after dividing the whole
+matrix through by ``m33``. Row 2 and column 2 are exactly ``[0,0,1,0]`` on every sample in
+the archive, so nothing else is carried.
+"""
+
+PROJ_ENTRIES = ((0, 0), (0, 1), (0, 3), (1, 0), (1, 1), (1, 3), (3, 0), (3, 1))
+"""Which entries :func:`proj_from_matrix` keeps, in order. ``m33`` is the normaliser."""
 
 
 def affine_from_matrix(m: np.ndarray) -> np.ndarray:
-    """(..., 4, 4) -> (..., 6). Discards entries measured to be constant on all samples."""
+    """(..., 4, 4) -> (..., 6). **Lossy on two of the thirteen layers -- prefer
+    :func:`proj_from_matrix`.**
+
+    This drops the perspective column ``(m03, m13, m33)`` on the assumption, stated in this
+    module's own header until v1.1 measured it, that layer transforms are affine. Eleven
+    layers satisfy that. Two do not: ``TVC_sh0260 Layer_52`` runs ``m33`` from 0.672 to 1.801
+    and ``FAM red_1`` carries ``m03`` up to 0.028, so ``matrix_from_affine`` is not the
+    inverse of this function on them.
+
+    The cost is not a rounding error. Round-tripping the *artist's own* transform track
+    through these 6 numbers and re-rendering -- the case that must come out at 1.000 -- moves
+    control points by 0.45 crop px mean and 6.2 px worst on ``red_1``, which renders at
+    0.9100 soft IoU, and by 23.8 px worst on ``Layer_52``. A transform head trained against
+    this target therefore cannot be scored above that ceiling no matter how well it predicts,
+    which is most of why v1's head read 0.756 and looked unusable.
+
+    Kept, unchanged, because every v1 number was measured through it.
+    """
     m = np.asarray(m)
     return np.stack([m[..., 0, 0], m[..., 0, 1], m[..., 1, 0], m[..., 1, 1],
                      m[..., 3, 0], m[..., 3, 1]], axis=-1)
+
+
+def proj_from_matrix(m: np.ndarray) -> np.ndarray:
+    """(..., 4, 4) -> (..., 8). Lossless for every transform in this archive.
+
+    A projective map is defined only up to overall scale, so the matrix is first divided
+    through by ``m33`` to fix the gauge. That is safe here and not in general: ``m33`` is
+    measured to stay in [0.672, 1.801] across the archive, never near zero. Fixing the gauge
+    rather than predicting nine free numbers is what stops a scale-invariant target from
+    drifting toward the degenerate ``m33 -> 0``.
+
+    Strictly contains :func:`affine_from_matrix`: an affine track has ``m03 = m13 = 0`` and
+    ``m33 = 1``, so three of these eight entries are then constant.
+    """
+    m = np.asarray(m, np.float64)
+    w = m[..., 3, 3]
+    assert np.all(np.abs(w) > 1e-9), 'm33 at zero: the gauge normalisation is undefined'
+    m = m / w[..., None, None]
+    return np.stack([m[..., r, c] for r, c in PROJ_ENTRIES], axis=-1)
+
+
+def matrix_from_proj(a: np.ndarray) -> np.ndarray:
+    """(..., 8) -> (..., 4, 4). Exact inverse of :func:`proj_from_matrix` as a map on the
+    plane -- measured at 7e-16 normalised units across every matrix in the archive, against
+    0.98 for the 6-number affine form.
+
+    "As a map on the plane" is the necessary qualifier and not a hedge. Dividing through by
+    ``m33`` leaves ``m22 = 1/m33``, so the reconstructed matrix is not entry-for-entry equal
+    to the original. It does not need to be: ``render.raster.apply_transform`` lifts points as
+    ``[x, y, 0, 1]``, so row 2 is multiplied by zero and column 2 is never read. ``m22`` is
+    written as 1 here because that is the value the rest of the pipeline expects to see.
+    """
+    a = np.asarray(a)
+    out = np.zeros(a.shape[:-1] + (4, 4), dtype=np.float64)
+    out[..., 2, 2] = 1.0
+    out[..., 3, 3] = 1.0
+    for i, (r, c) in enumerate(PROJ_ENTRIES):
+        out[..., r, c] = a[..., i]
+    return out
 
 
 def matrix_from_affine(a: np.ndarray) -> np.ndarray:

@@ -41,10 +41,18 @@ def test_catmullrom_passes_through_keys_and_curves_between():
     assert sample(cr, 15)[0] == pytest.approx(9.875)      # hand-computed from the basis
 
 
-def test_catmullrom_falls_back_to_linear_at_track_ends():
-    """The first and last segments lack a neighbour on one side, so they degrade to linear."""
+def test_catmullrom_clamps_at_track_ends_rather_than_dropping_to_linear():
+    """The first and last segments lack an outer neighbour, so the endpoint stands in for it.
+
+    Hand-computed: on the first segment p0 is clamped to k0, giving
+    ``0.5 * (2*0 + 10*0.5 + 40*0.25 - 30*0.125) = 5.625`` at the midpoint -- curved, where
+    the earlier code silently returned the linear 5.0. Both ends stay exact on their keys.
+    """
     t = _track(CATMULLROM)
-    assert sample(t, 5)[0] == pytest.approx(5.0)
+    assert sample(t, 5)[0] == pytest.approx(5.625)
+    assert sample(t, 25)[0] == pytest.approx(4.375)         # tail segment, mirror image
+    for k in t:
+        assert sample(t, k.frame)[0] == pytest.approx(k.value[0], abs=1e-9)
 
 
 def test_interp_is_per_key_not_global():

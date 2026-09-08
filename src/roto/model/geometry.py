@@ -15,8 +15,16 @@ local points under the layer transform, and the factorisation the renderer depen
 survives.
 
 The layer transform is applied, not predicted, on this path. v1 teacher-forces motion; the
-affine head is trained and reported separately so its error is visible rather than folded into
-the geometry number.
+transform head is trained and reported separately so its error is visible rather than folded
+into the geometry number.
+
+**The transform head needed the same medicine, and v1.1 gives it.** Its target was
+``affine_from_matrix`` of the composed layer matrix -- a *document*-space quantity, whose
+translation entries are normalised document units, predicted from a crop that shows none of
+that. That is the identical framing error, and it produced the identical symptom: a head that
+trains and renders at 0.606. :func:`crop_matrix` closes the composition, so the target becomes
+the local-to-crop map the picture actually depicts, and the mapping back to a document matrix
+is exact.
 """
 from __future__ import annotations
 
@@ -54,3 +62,24 @@ def crop_to_local(crop_pts: np.ndarray, matrix: np.ndarray, *, width: int, heigh
     w = r[:, 3:4]
     out = r[:, :2] / np.where(np.abs(w) < 1e-12, 1.0, w)
     return out.reshape(crop_pts.shape)
+
+
+def crop_matrix(*, width: int, height: int, offset: tuple[float, float], scale: float,
+                out_px: int) -> np.ndarray:
+    """The document-normalised -> crop-``[0,1]`` map of one frame, as a 4x4 row-vector matrix.
+
+    :func:`local_to_crop` is ``p @ M`` (the composed layer matrix), a perspective divide, and
+    then this. Written as a matrix, the last step *composes* with the first, so the whole
+    local-to-crop map is ``M @ crop_matrix(...)`` and a crop-space transform target is one
+    matrix multiply away from a document-space one. Composition is exact rather than
+    approximate: this matrix has ``[0,0,0,1]`` for its own column 3, so ``(M @ C)[:, 3] ==
+    M[:, 3]`` -- the perspective column that :func:`~roto.program.proj_from_matrix` carries
+    survives the change of space untouched, and the inverse is just ``@ inv(C)``.
+    """
+    x0, y0 = offset
+    c = np.zeros((4, 4))
+    c[0, 0] = c[1, 1] = height * scale / out_px
+    c[2, 2] = c[3, 3] = 1.0
+    c[3, 0] = (width / 2.0 - x0) * scale / out_px
+    c[3, 1] = (height / 2.0 - y0) * scale / out_px
+    return c

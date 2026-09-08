@@ -27,6 +27,7 @@ from ..render.raster import RenderConfig, shape_polyline
 
 ARTIST_COLOUR = '#4dd0e1'
 MODEL_COLOUR = '#ffb74d'
+BEFORE_COLOUR = '#ef5350'
 BACKGROUND = '#111318'
 
 
@@ -99,6 +100,61 @@ def element_figure(layer_dir: str | Path, artist: RotoDoc, model: RotoDoc, frame
     fig.suptitle(f'{layer_id}    frame {frame}{"    " + extra if extra else ""}',
                  color='#e8eaed', fontsize=10, x=0.02, ha='left', y=0.955)
     return fig
+
+
+def comparison_figure(rows: Sequence[dict], out_path: str | Path, title: str) -> Path:
+    """One page, one row per layer: artist, the alpha, and *two* reconstructions side by side.
+
+    The figure the v1.1 review asks the report to lead with, and the reason is that the
+    aggregate hides the result. Eight easy layers dilute two hard ones, so the headline moved
+    by +0.051 while the two worst rows moved by +0.039 and +0.038 -- and only on the two hard
+    rows is the difference something an artist would call a different quality of work rather
+    than a different number. Putting the same frame of the same layer under both models is the
+    only presentation in which that is visible instead of argued.
+    """
+    n = len(rows)
+    fig, axes = plt.subplots(n, 4, figsize=(14.5, 3.5 * n), facecolor=BACKGROUND,
+                             squeeze=False)
+    fig.subplots_adjust(left=0.012, right=0.988, top=1 - 0.75 / (3.5 * n + 1),
+                        bottom=0.01, wspace=0.04, hspace=0.30)
+
+    for r, row in enumerate(rows):
+        alpha = load_alpha(row['dir'], row['frame'])
+        for c in range(4):
+            ax = axes[r][c]
+            ax.set_facecolor(BACKGROUND)
+            ax.set_xlim(0, row['out_px']); ax.set_ylim(row['out_px'], 0)
+            ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_color('#3a3f4b')
+        for xy in polylines(row['artist'], row['frame'], row['crop']):
+            axes[r][0].plot(xy[:, 0], xy[:, 1], color=ARTIST_COLOUR, lw=0.6)
+        axes[r][1].imshow(alpha, cmap='gray', vmin=0, vmax=1, interpolation='nearest')
+        for xy in polylines(row['before'], row['frame'], row['crop']):
+            axes[r][2].plot(xy[:, 0], xy[:, 1], color=BEFORE_COLOUR, lw=0.6)
+        for xy in polylines(row['after'], row['frame'], row['crop']):
+            axes[r][3].plot(xy[:, 0], xy[:, 1], color=MODEL_COLOUR, lw=0.6)
+
+        # Two lines per title. A layer id is 34 characters and the panel is 3.6 inches
+        # wide, so a single-line "id · frame · shapes" overruns the panel and collides
+        # with the next one's title -- matplotlib does not clip titles to the axes.
+        axes[r][0].set_title(f'artist splines\n{row["layer_id"]}',
+                             color=ARTIST_COLOUR, fontsize=8, loc='left', pad=4)
+        axes[r][1].set_title(f'clean alpha — all the model is given\n'
+                             f'frame {row["frame"]}  ·  {row["n_shapes"]} shapes',
+                             color='#9aa0a6', fontsize=8, loc='left', pad=4)
+        axes[r][2].set_title(f'{row["before_label"]}\nsoft IoU {row["before_soft"]:.4f}',
+                             color=BEFORE_COLOUR, fontsize=8, loc='left', pad=4)
+        axes[r][3].set_title(f'{row["after_label"]}\nsoft IoU {row["after_soft"]:.4f}'
+                             f'   ({row["after_soft"] - row["before_soft"]:+.4f})',
+                             color=MODEL_COLOUR, fontsize=8, loc='left', pad=4)
+
+    fig.suptitle(title, color='#e8eaed', fontsize=12, x=0.012, ha='left',
+                 y=1 - 0.2 / (3.5 * n + 1))
+    out = Path(out_path)
+    fig.savefig(out, dpi=140, facecolor=BACKGROUND)
+    plt.close(fig)
+    return out
 
 
 def contact_sheet(rows: Sequence[dict], out_path: str | Path, title: str) -> Path:

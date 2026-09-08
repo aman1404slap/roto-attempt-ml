@@ -25,7 +25,7 @@ import numpy as np
 
 from ..ir import (ADD, BEZIER, BSPLINE, SUBTRACT, Key, Layer, RotoDoc, Shape,
                   opacity_at, sample)
-from .curves import eval_bspline, eval_silhouette_bezier
+from .curves import DUPLICATE, OPEN_END_RULE, eval_bspline, eval_silhouette_bezier
 
 
 STROKE_WIDTH_GAIN = 0.0625
@@ -34,14 +34,33 @@ STROKE_WIDTH_GAIN = 0.0625
 Empirically calibrated, not derived: ``width * height`` overestimates by ~16x on
 TVC_sh0230 (0.039 -> 50px, where ~2-3px matches the hair the artist drew). A gain of 1.0
 would put strokes at roughly 16x their real width, which is why an unscaled stroke
-renders came out hairline. Still a knob, not a claim, until we can diff against
-Silhouette's own renderer.
+renders came out hairline.
+
+**Now diffed against Silhouette's own renderer, and 1/16 is neither a unit nor an optimum.**
+The suspicion that 0.0625 = 1/16 exactly meant Silhouette defines strokeWidth in a 16-per-unit
+system is refuted: agreement with the delivered EXRs improves monotonically *past* 1/16 on
+every layer tested and flattens only where ``default_stroke_px``'s 1 px floor takes over, so
+these strokes are at or below one pixel in the reference render. A unit conversion would have
+won on both shots; this loses to 1/64 on both. Left unchanged because the gain re-renders the
+training alphas -- see ``v1.1/results/render_conventions.json``.
 """
 
 
 def default_stroke_px(width: float, height: int) -> float:
-    """Convert a shape's ``strokeWidth`` to pixels."""
+    """Convert a shape's ``strokeWidth`` to pixels. v1's convention -- see the gain above."""
     return max(1.0, width * height * STROKE_WIDTH_GAIN)
+
+
+def measured_stroke_px(width: float, height: int) -> float:
+    """The stroke width the delivered EXRs actually show: a hairline, floored at 1 px.
+
+    The gain sweep against Silhouette's own render improves monotonically as the gain falls
+    and then stops changing entirely -- 1/64, 1/128 and 1/256 all score 0.49559 on FAM green 2
+    against 1/16's 0.49313 -- because below 1/64 the 1 px floor is what every stroke gets. So
+    the measured answer is not a smaller gain, it is *the floor*: these strokes are at or under
+    one pixel in the reference, and the gain is doing nothing but adding width Silhouette does
+    not draw."""
+    return 1.0
 
 
 @dataclass(slots=True)
@@ -60,8 +79,55 @@ class RenderConfig:
     """Open shapes with strokeWidth == 0: fill as if closed.
 
     516 of nfl_0080's shapes are open with zero width, and filling them is what reaches
-    0.85 IoU there. Also unverified against the reference renderer.
+    0.85 IoU there. **Refereed against the delivered EXRs and measured wrong**: on nfl_0080
+    MB 2, where 508 of 510 shapes are open at zero width, ``False`` scores 0.9442 against
+    ``True``'s 0.8992. Left at ``True`` because changing it re-renders the training alphas
+    and so needs a dataset rebuild -- see ``v1.1/results/render_conventions.json``.
     """
+    open_end_rule: str = OPEN_END_RULE
+    """How an open B-spline is extended past its end points. See ``render.curves``."""
+    clip_per_shape: bool = True
+    """Clip the accumulator to [0,1] after *every* shape, rather than once at layer output.
+
+    The two differ only where a Subtract follows overlapping Adds: clipping first discards
+    the overshoot, so the Subtract removes less than it would have. Only two layers in the
+    archive mix Subtracts with Adds at all (7 shapes in FAM blue 1, 2 in sh0230 L100), which
+    is few enough to referee against the delivered EXR rather than assume. Measured on FAM
+    blue 1 at full resolution: identical to four decimals either way, so the assumption is
+    safe here -- see ``v1.1/results/render_conventions.json``.
+    """
+
+
+def measured_conventions(supersample: int = 4) -> RenderConfig:
+    """The render conventions **refereed against Silhouette's own EXRs**, as one object.
+
+    Three of the four conventions v1.1 measured came out against what the code shipped, and
+    all three were left in place there deliberately: changing any of them re-renders the
+    training alphas, and v1.1's whole value is being comparable to v1 row for row. That
+    argument expires at the v2 dataset rebuild. Carrying them forward instead would train the
+    model to draw strokes Silhouette does not draw -- invisible in a self-scored number, and
+    visible the first day a real ``.sfx`` ships.
+
+    ==========================  ================  ==========================================
+    convention                  v1 / v1.1         measured, and by how much
+    ==========================  ================  ==========================================
+    ``fill_open_zero_width``    ``True``          ``False``: 0.9442 vs 0.8992 on nfl_0080
+                                                  MB 2, where 508 of 510 shapes are open at
+                                                  zero width
+    ``stroke_px``               gain 1/16         the 1 px floor: 0.49559 vs 0.49313 on FAM
+                                                  green 2, and flat below 1/64
+    ``open_end_rule``           ``triplicate``    ``duplicate``: +0.0006 and +0.0078 on the
+                                                  two layers that can referee it
+    closed-shape rendering      --                **verified**, 0.9865-0.9949 on three layers
+                                                  with no open shapes -- the control that
+                                                  makes the other three readable
+    ==========================  ================  ==========================================
+
+    Exposed as a function rather than as three edits so the rebuild is one flag
+    (``CropConfig.conventions='measured'``) and cannot land two of the three by accident.
+    """
+    return RenderConfig(supersample=supersample, stroke_px=measured_stroke_px,
+                        fill_open_zero_width=False, open_end_rule=DUPLICATE)
 
 
 def trs_matrix(trs: dict[str, list[Key]], frame: float) -> np.ndarray | None:
@@ -144,7 +210,7 @@ def shape_polyline(shape: Shape, frame: float, ancestors: Sequence[Layer],
         p = apply_transform(mat, p)
     if len(p) < 3:
         return p
-    return eval_bspline(p, shape.closed, cfg.samples_per_seg)
+    return eval_bspline(p, shape.closed, cfg.samples_per_seg, cfg.open_end_rule)
 
 
 def render(doc: RotoDoc, frame: float, cfg: RenderConfig | None = None,
@@ -229,8 +295,11 @@ def render(doc: RotoDoc, frame: float, cfg: RenderConfig | None = None,
             np.subtract(target, view, out=target)
         else:
             np.add(target, view, out=target)
-        np.clip(target, 0.0, 1.0, out=target)
+        if cfg.clip_per_shape:
+            np.clip(target, 0.0, 1.0, out=target)
 
+    if not cfg.clip_per_shape:
+        np.clip(acc, 0.0, 1.0, out=acc)
     if ss > 1:
         acc = cv2.resize(acc, (W // ss, H // ss), interpolation=cv2.INTER_AREA)
     return acc

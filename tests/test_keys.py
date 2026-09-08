@@ -59,6 +59,34 @@ def test_f1_matching_is_one_to_one():
     p, r, s = f1(np.array([10, 11]), np.array([10]), tolerance=1)
     assert r == 1.0 and p == 0.5
 
+
+def test_f1_assignment_does_not_depend_on_prediction_order():
+    """Globally-sorted assignment: an early distant prediction cannot deny a closer later one.
+
+    Predictions 9 and 10 against truth 10 with tolerance 1. Matching in input order gives 9
+    the key and leaves 10 -- an exact hit -- unmatched. Sorted globally, the exact pair wins,
+    and the score is the same whichever order the predictions arrive in.
+    """
+    assert f1(np.array([9, 10]), np.array([10]), tolerance=1) == \
+           f1(np.array([10, 9]), np.array([10]), tolerance=1)
+    # Two truth keys, two predictions, one crossing pair: both must match.
+    p, r, s = f1(np.array([11, 20]), np.array([10, 20]), tolerance=1)
+    assert (p, r) == (1.0, 1.0)
+
+
 def test_segment_error_is_zero_on_its_endpoints():
     track = planted([0, 25], 26)
     assert segment_errors(track, 0, 25) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_segment_error_is_euclidean_not_manhattan():
+    """A purely diagonal miss must read as its true distance, not sqrt(2) times it.
+
+    The track runs straight from 0 to (10, 10) over two frames with the middle frame pushed
+    (1, 1) off the chord. Euclidean says sqrt(2); ``|dx| + |dy|`` said 2.0, which is what
+    made a '1.0 px tolerance' mean something an artist could not measure.
+    """
+    track = np.zeros((3, 1, 2))
+    track[1] = [[5.0 + 1.0, 5.0 + 1.0]]
+    track[2] = [[10.0, 10.0]]
+    assert segment_errors(track, 0, 2) == pytest.approx(np.sqrt(2.0))

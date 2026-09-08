@@ -234,8 +234,15 @@ def sample(keys: Sequence[Key], frame: float) -> Any:
         return k0.value
     u = (frame - k0.frame) / (k1.frame - k0.frame)
 
-    if k0.interp == CATMULLROM and 0 < i < len(keys) - 2:
-        a, b = keys[i - 1].value, keys[i + 2].value
+    if k0.interp == CATMULLROM:
+        # Endpoints are *clamped*, not dropped to linear. The outer neighbour a first or
+        # last segment lacks is replaced by the segment's own endpoint, which is the
+        # standard clamped-CR rule and keeps one interpolation law across the whole track.
+        # Measured immaterial at this archive's key spacing (<= 2e-4 soft IoU, see
+        # v1.1/results/cr_variants.json), but dense targets for 8 of 13 training layers
+        # flow through here and a sparser-keyed shot would not be as forgiving.
+        a = keys[i - 1].value if i > 0 else k0.value
+        b = keys[i + 2].value if i + 2 < len(keys) else k1.value
         if np.shape(a) == np.shape(k0.value) == np.shape(k1.value) == np.shape(b):
             p0, p1, p2, p3 = a, k0.value, k1.value, b
             return 0.5 * (2 * p1 + (-p0 + p2) * u

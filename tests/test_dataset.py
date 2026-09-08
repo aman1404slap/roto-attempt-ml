@@ -17,6 +17,8 @@ indexed by the dense key axis. At stride 1 the two axes coincide and everything 
 stride 1 the track runs off its end and the live mask collapses, so shapes render dead. It is
 invisible in exactly the configuration a smoke run uses.
 """
+import json
+
 import numpy as np
 import pytest
 
@@ -25,6 +27,7 @@ from roto.dataset import CropConfig, build, discover, load_alpha, load_meta
 from roto.metrics import soft_iou
 from roto.program import decode, load_program
 from roto.render.raster import RenderConfig, render_union
+from roto.sfx.json_ir import from_json_ir
 
 LAYER = 'nfl_0200_bg01_v001_compplate_roto_v001__blue'
 ROUND_TRIP_TOL = 1e-4
@@ -60,6 +63,35 @@ def test_program_round_trips_to_the_matte(tmp_path, stride):
         x0, y0 = meta['crop']['offsets'][str(f)]
         pred = render_union(doc, f, cfg, scale, (x0, y0, size, size))
         assert soft_iou(pred, load_alpha(built.directory, f)) == pytest.approx(1.0, abs=ROUND_TRIP_TOL)
+
+
+def test_scoring_path_inherits_the_datasets_own_supersample(tmp_path):
+    """The reconstruction scorer must render at the supersample the target was built at.
+
+    It used to render predictions at a hardcoded ``supersample=2`` while v001's alphas were
+    written at 4. Soft IoU is built to notice exactly that disagreement, so every v1 score
+    paid an anti-aliasing penalty with no geometry in it -- measured at up to 4.7 points on
+    FAM green_1, where re-rendering the *artist's own shapes* scored 0.953 instead of 1.000.
+    Carrying the value through ``LayerData.crop`` is what keeps the comparison like for like.
+    """
+    from roto.model.data import load_element
+
+    layer = next(e for e in discover(DATA) if e.layer_id == LAYER)
+    built = build(layer, DATA, tmp_path, CropConfig(size=128, supersample=4, stride=40))
+    meta = load_meta(built.directory)
+    el = load_element(built.directory)
+    assert el.crop['supersample'] == meta['render']['supersample'] == 4
+
+    cfg = RenderConfig(supersample=el.crop['supersample'])
+    for f in meta['frames']['index']:
+        x0, y0 = el.crop['offsets'][int(f)]
+        box = (x0, y0, el.out_px / el.crop['scale'], el.out_px / el.crop['scale'])
+        pred = render_union(from_json_ir(json.loads(
+            (built.directory / 'target_ir.json').read_text())), int(f), cfg,
+            el.crop['scale'], box)
+        truth = load_alpha(built.directory, int(f))
+        pred = pred[:truth.shape[0], :truth.shape[1]]
+        assert soft_iou(pred, truth) == pytest.approx(1.0, abs=ROUND_TRIP_TOL)
 
 
 def test_transform_track_is_dense_regardless_of_stride(tmp_path):

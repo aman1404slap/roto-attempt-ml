@@ -31,9 +31,30 @@ partition, which is why a matte cannot simply be split back into its shapes.
 
 v1 is complete: **13 layers across 4 shots reconstruct at 0.9218 soft IoU.** See
 [v1/OVERVIEW.md](v1/OVERVIEW.md) for what that means and [v1/tech.md](v1/tech.md) for how.
+`v1/` is frozen; its published numbers are reproducible at commit `2d1d53e`.
 
-v1 is an **overfit** — trained and measured on the same 13 layers. It answers "can we regenerate
-roto we have been shown", not "can we roto an unseen shot". That is v2.
+v1.1 answers the v1 code review, and then a review of v1.1, on the same 13 layers:
+**0.9742 soft IoU**, 0.92 px point error, at 0.80× the artist's keyframe count — or **0.9712
+with a layer-motion head that also works** (0.9567 rendered, from 0.7938), which is the version
+to build v2 on. See [v1.1/OVERVIEW.md](v1.1/OVERVIEW.md),
+[v1.1/review-response.md](v1.1/review-response.md) and
+[v1.1/v1.1-review-response.md](v1.1/v1.1-review-response.md).
+
+The aggregate is the least informative number in that table. **The two layers that were broken
+went 0.7316 → 0.9533 and 0.7739 → 0.9614**, exactly as the v1 review predicted they would when
+it named shape-query collision as the cause; the mean moved only +0.051 because eight of the
+thirteen layers were already above 0.96 and had nothing left to give. Separately, 87% of the
+aggregate gain is training 3.3× longer on v1's unmodified configuration — at 12k steps nothing
+in the ladder has converged, which `v1_control_long` proves rather than assumes.
+
+v1.1 also corrects how the system is measured, referees four render conventions against
+Silhouette's own EXRs, and fixes three bugs found by scoring the case that must come out
+perfect — the strongest habit to carry forward. Because metric fixes landed, the same v1
+checkpoint no longer scores what v1 published, so v1.1 compares against a re-baselined row
+rather than 0.9218.
+
+Both are an **overfit** — trained and measured on the same 13 layers. They answer "can we
+regenerate roto we have been shown", not "can we roto an unseen shot". That is v2.
 
 ## Setup
 
@@ -88,30 +109,40 @@ src/roto/
   ir.py            the intermediate representation everything converts through
   shots.py         locating each shot's .sfx
   metrics.py       iou, soft_iou
+  exr.py           Silhouette's delivered mattes, for refereeing render conventions
   sfx/             .sfx reader, JSON form, writer seam
   render/          deterministic rasteriser (curves, raster)
   dataset/         layer manifest -> matte + spline program per layer
   program/         spline program <-> dense arrays
-  keys/            keyframe selection by curve simplification
-  model/           network, training, reconstruction, figures
-scripts/           eval_keys.py, report_v1.py
-tests/             61 tests
+  keys/            keyframe selection by curve simplification, key-value refit
+  model/           network, training, reconstruction, smoothing, curve loss, figures
+scripts/           eval_keys.py, report_v1.py, and the v1.1 set:
+                   train_v11.py / report_v11.py / summarise_v11.py,
+                   sweep_operating_point.py, fig_worst_layers.py,
+                   exp_conventions.py, exp_peak_frames.py,
+                   exp_offset_jitter.py, exp_affine_target.py
+tests/             100 tests
 v1/                deliverables (gitignored): docs, checkpoint, results, figures
+v1.1/              same, for the review response: ladder, sweeps, referees
 ```
 
 ## Tests
 
 ```bash
-pytest            # 61 tests, ~75s — they render real archive frames
+pytest            # 100 tests, ~75s — they render real archive frames
 ```
 
-Two carry the most weight:
+Three carry the most weight:
 
 - **`test_dataset.py`** asserts `decode(encode(program))` renders back to the layer's own
   matte, at strides 1, 7 and 20. Tolerance is `1e-4`, which is 16-bit PNG quantisation on the
   stored matte and nothing else. If it needs raising, the representation lost something.
 - **`test_keys.py`** measures keyframe selection against tracks with planted, known keyframes,
   so it is scored on ground truth rather than on its own output.
+- **`test_v11.py`** pins the transform representation both ways: that the 6-number affine form
+  the pipeline shipped with is *lossy* on a perspective transform, and that the 8-number
+  projective form replacing it is exact. That asymmetry was a real ceiling on a real head, and
+  a test is the only thing that stops it coming back.
 
 ## Not in scope yet
 

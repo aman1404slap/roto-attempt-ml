@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
+import numpy as np
+
 from ..ir import RotoDoc
 from ..render.raster import RenderConfig, content_bbox, render_union
 
@@ -34,6 +36,34 @@ class CropConfig:
     """Scale for the cheap bbox survey pass, not for the emitted alpha."""
     stride: int = 1
     """Emit every ``stride``th frame. 1 for a real build; larger for a smoke run."""
+    conventions: str = 'v1'
+    """Which render conventions the alphas are drawn with.
+
+    ``'v1'`` is what ``datasets/v001`` holds and what every published number is measured
+    against. ``'measured'`` is the set refereed against Silhouette's delivered EXRs -- see
+    ``render.raster.measured_conventions``, which lists all four and what each is worth.
+
+    This is deliberately one string rather than three fields. Three of the conventions were
+    measured wrong, and the v2 rebuild has to change all three together or the dataset is a
+    mixture nobody can attribute. Note that flipping it **re-renders the training alphas**, so
+    a dataset built this way is not comparable row for row with ``v001`` and has to be
+    re-baselined once against v1.1's checkpoint before any new number means anything.
+    """
+    smooth_offsets: int = 0
+    """Frames of smoothing on the per-frame offset track. 0 leaves it as measured.
+
+    The offsets come from a 0.25-scale survey render, so each is quantised to the nearest 4
+    source pixels and rounded to an integer, which makes the window twitch frame to frame
+    even when the layer moves smoothly. That is harmless while the offsets are *given* -- the
+    mapping to crop space is exact either way, so nothing is mis-measured.
+
+    It stops being harmless once the network is shown three consecutive frames (see
+    ``model.net.AlphaEncoder``), because a twitching window injects motion into the stack
+    that the layer never had, and the temporal window exists precisely to exploit real
+    frame-to-frame continuity. Off by default because turning it on changes the rendered
+    alphas and so requires rebuilding the dataset -- see ``v1.1/results/offset_jitter.json``
+    for the measured size of the effect.
+    """
 
 
 @dataclass(slots=True)
@@ -103,4 +133,23 @@ def crop_plan(doc: RotoDoc, frames: Sequence[int], cfg: CropConfig,
         if f == first:
             break
         offsets[f] = offsets[first]
+    if cfg.smooth_offsets > 1:
+        offsets = smooth_offsets(offsets, frames, cfg.smooth_offsets)
     return CropPlan(size, offsets, 'tracking')
+
+
+def smooth_offsets(offsets: dict[int, tuple[int, int]], frames: Sequence[int],
+                   window: int) -> dict[int, tuple[int, int]]:
+    """Smooth the offset track along time and re-round to whole source pixels.
+
+    Whole pixels, not fractions: the offset is the top-left of a pixel-aligned window, and a
+    fractional one would mean resampling the alpha, which would blur the very edges soft IoU
+    is measuring.
+    """
+    from ..model.smoothing import SAVGOL, smooth_track
+
+    order = [f for f in frames if f in offsets]
+    track = np.array([offsets[f] for f in order], float)
+    smoothed = smooth_track(track, window, SAVGOL)
+    return {f: (int(round(smoothed[i, 0])), int(round(smoothed[i, 1])))
+            for i, f in enumerate(order)}

@@ -68,12 +68,17 @@ def segment_errors(track: np.ndarray, a: int, b: int) -> float:
     ``track`` is ``(T, P, 2)``. Endpoints are exact by construction, so a segment of length 1
     or 2 costs nothing -- which is what makes a dense key set trivially achievable and the
     tolerance, not the DP, the thing that decides sparsity.
+
+    The error is the **Euclidean** distance a point sits from where interpolation would put
+    it. This used to be ``|dx| + |dy|``, which reads a purely diagonal miss as sqrt(2) times
+    its real size, so a tolerance stated in pixels did not mean the distance an artist would
+    measure. Because L1 >= L2, the same tolerance now admits slightly longer segments.
     """
     if b - a < 2:
         return 0.0
     w = np.linspace(0.0, 1.0, b - a + 1, dtype=np.float64)[1:-1, None, None]
     approx = track[a][None] * (1.0 - w) + track[b][None] * w
-    return float(np.abs(approx - track[a + 1:b]).sum(axis=-1).max())
+    return float(np.linalg.norm(approx - track[a + 1:b], axis=-1).max())
 
 
 def _cost_matrix(track: np.ndarray, cand: np.ndarray) -> np.ndarray:
@@ -168,21 +173,31 @@ def f1(predicted: np.ndarray, truth: np.ndarray, tolerance: int = 0) -> tuple[fl
     """Precision, recall, F1 of a predicted key set against the artist's.
 
     ``tolerance`` allows a predicted key to count if it lands within N frames of a real one.
-    Matching is greedy nearest-first and one-to-one, so two predictions cannot both claim the
-    same artist key -- without that, over-keying would inflate recall for free, which is the
-    exact failure this module exists to avoid measuring badly.
+    Matching is one-to-one, so two predictions cannot both claim the same artist key --
+    without that, over-keying would inflate recall for free, which is the exact failure this
+    module exists to avoid measuring badly.
+
+    Candidate pairs are sorted by distance **globally** before being assigned. Matching them
+    in input order instead let an early, more distant prediction take a truth key that a
+    later, closer one needed, so the score depended on the order predictions arrived in. The
+    hit *count* can only improve or stay equal under global sorting; what it removes is the
+    order dependence.
     """
     if len(truth) == 0:
         return (0.0, 1.0, 0.0) if len(predicted) else (1.0, 1.0, 1.0)
     if len(predicted) == 0:
         return 1.0, 0.0, 0.0
-    unused = set(range(len(truth)))
-    hits = 0
-    for p in predicted:
-        near = [(abs(p - truth[t]), t) for t in unused if abs(p - truth[t]) <= tolerance]
-        if near:
-            unused.discard(min(near)[1])
-            hits += 1
+    pairs = sorted((abs(int(p) - int(t)), pi, ti)
+                   for pi, p in enumerate(predicted)
+                   for ti, t in enumerate(truth)
+                   if abs(int(p) - int(t)) <= tolerance)
+    taken_p: set[int] = set()
+    taken_t: set[int] = set()
+    for _, pi, ti in pairs:
+        if pi not in taken_p and ti not in taken_t:
+            taken_p.add(pi)
+            taken_t.add(ti)
+    hits = len(taken_p)
     prec = hits / len(predicted)
     rec = hits / len(truth)
     return prec, rec, (2 * prec * rec / (prec + rec) if prec + rec else 0.0)

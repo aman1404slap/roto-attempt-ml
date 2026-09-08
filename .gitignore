@@ -17,3 +17,5 @@ __pycache__/
 
 # v1 deliverables: trained model, results, figures
 /v1/
+
+/v1.1/

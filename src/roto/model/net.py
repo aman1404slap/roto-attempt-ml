@@ -21,11 +21,13 @@ shots, not to generalise to unseen ones. It also means **the v1 number does not 
 v2 must replace these embeddings with queries the encoder produces, and the gap between the
 two is the honest measure of what the encoder still has to learn.
 
-**No self-attention among shape queries.** A decoder that lets 1036 queries attend to each
-other costs O(S^2) and, on a 16-core CPU with no GPU, that alone would put a single epoch out
-of reach. Queries cross-attend to the image and not to each other. The cost is that shapes
-cannot negotiate -- two queries may both claim the same contour -- which is a real limitation
-and the first thing to revisit when a GPU is available.
+**Self-attention among shape queries is optional, and v1.1 turns it on.** v1 left it out
+because O(S^2) at S=1036 on a 16-core CPU put a single epoch out of reach, and the cost of
+its absence was visible in the numbers: 0.97+ soft IoU at <=75 shapes against 0.73-0.78 at
+592 and 1036, with two queries claiming one contour drawn as scribbles on the contact sheet.
+Measured on this GPU the same attention is 24 ms per call in 0.19 GB at S=1036 batch 6, so
+the constraint that justified dropping it is gone. ``self_attn=False`` reproduces v1 exactly
+and is the default, so old checkpoints still load.
 
 **The point head is a direct projection, not a query-slot outer product.** The obvious cheap
 head is ``MLP([query, point_slot]) -> 2``, which is a rank-limited outer product of one
@@ -38,6 +40,19 @@ Coordinates are predicted in **crop space** -- [0,1] across the alpha the networ
 and converted back to the IR's local normalised space afterwards. See ``roto.model.geometry``
 for why: local coordinates are absolute document positions whose range is up to 8x the crop,
 and regressing them directly was measured to stall at ~260 px.
+
+**The transform head is 8-wide in v1.1 and was 6-wide in v1**, because the 6-number affine
+target it was trained against is not a lossless description of these transforms -- two layers
+carry perspective, and on one of them round-tripping the *artist's own* track through 6
+numbers moves control points by 23.8 crop px. ``affine_dim`` selects the width;
+``proj_from_matrix``'s 8-number normalised homography is what 8 means. It defaults to 6 so
+that v1's checkpoints, whose ``arch`` predates the option, still load and still score the way
+they did.
+
+**``align_window`` is carried on the network rather than passed at the call site**, for the
+same reason ``in_frames`` is: a model trained on neighbour alphas warped into the anchor's
+crop window must be *given* them warped at inference, and a mismatch would surface as a
+mysterious quality loss rather than an error. See ``roto.model.data.LayerData.window``.
 """
 from __future__ import annotations
 
@@ -63,13 +78,22 @@ def sincos_2d(h: int, w: int, dim: int) -> torch.Tensor:
 
 
 class AlphaEncoder(nn.Module):
-    """256px alpha -> 16x16 feature tokens. Strided from the first layer to stay CPU-viable."""
+    """256px alpha -> 16x16 feature tokens. Strided from the first layer to stay CPU-viable.
 
-    def __init__(self, dim: int = 192) -> None:
+    ``in_frames`` is the temporal window: the number of consecutive alphas stacked as
+    channels. At 1 the network sees a single frame and its prediction error is independent
+    frame to frame, which is the jitter the whole pipeline downstream was built to absorb --
+    9-frame smoothing, then a 1 px key tolerance sitting above the noise rather than above
+    the artist's precision. Showing it 3 consecutive frames lets it steady its own hand
+    instead, and costs one convolution's worth of input channels.
+    """
+
+    def __init__(self, dim: int = 192, in_frames: int = 1) -> None:
         super().__init__()
         c1, c2, c3 = dim // 8, dim // 4, dim // 2
+        self.in_frames = in_frames
         self.stem = nn.Sequential(
-            nn.Conv2d(1, c1, 5, stride=2, padding=2), nn.GroupNorm(4, c1), nn.GELU(),
+            nn.Conv2d(in_frames, c1, 5, stride=2, padding=2), nn.GroupNorm(4, c1), nn.GELU(),
             nn.Conv2d(c1, c2, 3, stride=2, padding=1), nn.GroupNorm(8, c2), nn.GELU(),
             nn.Conv2d(c2, c2, 3, padding=1), nn.GroupNorm(8, c2), nn.GELU(),
             nn.Conv2d(c2, c3, 3, stride=2, padding=1), nn.GroupNorm(8, c3), nn.GELU(),
@@ -97,24 +121,54 @@ class CrossBlock(nn.Module):
         return q + self.ff(self.n2(q))
 
 
+class SelfBlock(nn.Module):
+    """Self-attention among shape queries, so shapes can negotiate rather than collide.
+
+    v1 left this out for a measured reason: on a 16-core CPU with no GPU, O(S^2) at S=1036
+    put a single epoch out of reach. The cost of its absence was also measured -- 0.97+ soft
+    IoU at <=75 shapes against 0.73-0.78 at 592 and 1036, with two queries claiming one
+    contour showing up as the scribbles on the contact sheet. On the GPU the same attention
+    is 24 ms per call in 0.19 GB at S=1036, batch 6, so the tradeoff that justified dropping
+    it no longer holds.
+
+    No attention mask is needed: a batch is drawn from a single layer, so every query in it
+    is a real shape rather than padding.
+    """
+
+    def __init__(self, dim: int, heads: int = 4) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        h = self.norm(q)
+        return q + self.attn(h, h, h, need_weights=False)[0]
+
+
 class RotoNet(nn.Module):
     """Alpha -> (control points per shape, 6-DOF affine per group)."""
 
     def __init__(self, max_shapes: int, max_groups: int, max_points: int,
-                 max_coords: int, dim: int = 192, depth: int = 3) -> None:
+                 max_coords: int, dim: int = 192, depth: int = 3,
+                 in_frames: int = 1, self_attn: bool = False, affine_dim: int = 6,
+                 align_window: bool = False) -> None:
         super().__init__()
         self.max_points, self.max_coords = max_points, max_coords
-        self.encoder = AlphaEncoder(dim)
+        self.in_frames, self.self_attn = in_frames, self_attn
+        self.affine_dim, self.align_window = affine_dim, align_window
+        self.encoder = AlphaEncoder(dim, in_frames)
         self.shape_bank = nn.Embedding(max_shapes, dim)
         self.group_bank = nn.Embedding(max_groups, dim)
         self.desc = nn.Linear(3, dim)             # n_points, closed, coords_per_point
         self.blocks = nn.ModuleList([CrossBlock(dim) for _ in range(depth)])
+        self.sblocks = nn.ModuleList([SelfBlock(dim) for _ in range(depth)]) \
+            if self_attn else None
         self.gblocks = nn.ModuleList([CrossBlock(dim) for _ in range(depth)])
         self.point_head = nn.Sequential(
             nn.LayerNorm(dim), nn.Linear(dim, dim * 2), nn.GELU(),
             nn.Linear(dim * 2, max_points * max_coords * 2))
         self.affine_head = nn.Sequential(
-            nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 6))
+            nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, affine_dim))
         # Predictions are in crop space, where the centre of the picture is 0.5. Starting at
         # zero would put every control point in the top-left corner and spend the first
         # thousand steps translating rather than shaping.
@@ -124,13 +178,16 @@ class RotoNet(nn.Module):
     def forward(self, alpha: torch.Tensor, shape_ids: torch.Tensor,
                 group_ids: torch.Tensor, desc: torch.Tensor
                 ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``alpha`` (B,1,256,256); ``shape_ids`` (B,S); ``group_ids`` (B,G); ``desc`` (B,S,3).
+        """``alpha`` (B,in_frames,256,256); ``shape_ids`` (B,S); ``group_ids`` (B,G); ``desc`` (B,S,3).
 
-        Returns points ``(B, S, Pmax, Cmax, 2)`` and affine ``(B, G, 6)``.
+        Returns points ``(B, S, Pmax, Cmax, 2)`` and the transform track
+        ``(B, G, affine_dim)``.
         """
         tokens = self.encoder(alpha)
         q = self.shape_bank(shape_ids) + self.desc(desc)
-        for blk in self.blocks:
+        for i, blk in enumerate(self.blocks):
+            if self.sblocks is not None:
+                q = self.sblocks[i](q)            # shapes negotiate, then look at the image
             q = blk(q, tokens)
         g = self.group_bank(group_ids)
         for blk in self.gblocks:

@@ -31,8 +31,8 @@ from matplotlib import pyplot as plt                                    # noqa: 
 
 from roto.model.data import load_element                                # noqa: E402
 from roto.model.figures import contact_sheet, element_figure            # noqa: E402
-from roto.model.reconstruct import (DEFAULT_TOL_PX, load_model,         # noqa: E402
-                                    reconstruct)
+from roto.model.reconstruct import (DEFAULT_TOL_PX, RebuildConfig,      # noqa: E402
+                                    load_model, reconstruct)
 from roto.sfx.json_ir import from_json_ir                               # noqa: E402
 
 
@@ -78,7 +78,8 @@ def main() -> None:
     rows, sheet = [], []
     for d in dirs:
         frame = pick_frame(d, rng)
-        rec = reconstruct(d, net, args.tol, shape_base=sbase.get(d.name, 0),
+        rec = reconstruct(d, net, RebuildConfig(tol_px=args.tol),
+                          shape_base=sbase.get(d.name, 0),
                           group_base=gbase.get(d.name, 0),
                           frames=[frame] if args.figures_only else None)
         s = rec.summary()

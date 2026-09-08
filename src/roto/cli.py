@@ -78,7 +78,8 @@ def cmd_dataset(args: argparse.Namespace) -> list[Path]:
     else:
         chosen = [e for e in found if e.is_target]
 
-    cfg = CropConfig(size=args.size, supersample=args.supersample, stride=args.stride)
+    cfg = CropConfig(size=args.size, supersample=args.supersample, stride=args.stride,
+                     conventions=args.conventions)
     out = []
     for e in chosen:
         b = build(e, args.data_root, args.out_dir, cfg)
@@ -123,6 +124,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument('--supersample', type=int, default=4)
     p.add_argument('--stride', type=int, default=1,
                    help='emit every Nth frame (1 = all; larger for a smoke run)')
+    p.add_argument('--conventions', default='v1', choices=['v1', 'measured'],
+                   help="render conventions: 'v1' reproduces datasets/v001, 'measured' uses "
+                        'the set refereed against the delivered EXRs (v2). Changing this '
+                        're-renders every alpha, so it needs a re-baseline, not a comparison')
     p.set_defaults(fn=cmd_dataset)
 
     args = ap.parse_args(argv)

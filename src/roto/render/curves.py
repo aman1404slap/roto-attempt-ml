@@ -21,24 +21,65 @@ def _wrap_closed(P: np.ndarray) -> np.ndarray:
     return np.vstack([P[(i - 1) % n] for i in range(n + 3)])
 
 
-def _clamp_open(P: np.ndarray) -> np.ndarray:
-    """Endpoint-clamped extension for open splines: triplicate the end points.
+TRIPLICATE, DUPLICATE, REFLECT, INTERIOR = 'triplicate', 'duplicate', 'reflect', 'interior'
+OPEN_END_RULES = (TRIPLICATE, DUPLICATE, REFLECT, INTERIOR)
 
-    NOTE: unverified against Silhouette's own open-spline convention. Open shapes are 51%
-    of the archive (strokes), so this is worth checking against the reference renderer
-    before trusting stroke geometry.
-    """
-    return np.vstack([P[0], P[0], *P, P[-1], P[-1]])
+OPEN_END_RULE = TRIPLICATE
+"""How an open B-spline's control polygon is extended past its ends.
+
+**Measured against Silhouette's own delivered EXRs, not assumed** -- see
+``v1.1/results/render_conventions.json`` and ``scripts/exp_conventions.py``. The four rules
+are genuinely different curves, not variations in taste:
+
+* ``triplicate`` -- repeat each end point three times, the standard clamped cubic B-spline.
+  The curve passes exactly through the first and last control point.
+* ``duplicate`` -- repeat each end point twice. The curve stops short of its end points.
+* ``reflect`` -- extend with ``2*P0 - P1``, the "natural" extension.
+* ``interior`` -- no extension; the curve spans only the interior segments, which is what a
+  plain uniform B-spline basis gives and leaves the ends undrawn.
+
+Open shapes are 51% of the archive, so this rule decides the geometry of half of it.
+
+**Measured result: the choice among the first three is nearly immaterial here.** Against the
+delivered EXRs at full resolution, on the two layers whose channel match is strong enough to
+read (FAM blue 1 at 0.969, nfl_0080 MB 2 at 0.898), triplicate/duplicate/reflect score
+0.9737/0.9743/0.9737 and 0.8992/0.9070/0.8992. ``duplicate`` is best by 0.0006 and 0.0078,
+which is not enough to move off the standard rule.
+
+``interior`` is **not a candidate** and is excluded from that comparison despite scoring
+highest, because it is not a rival convention -- it is less curve. These strokes are short
+(median 5 control points), so dropping the four end segments discards ~65% of the drawn
+length on average, and on the 21-30% of shapes with <=4 points it degenerates to drawing the
+control polygon itself. It wins by drawing less, which is the same confound the stroke-width
+sweep shows directly. It is kept only because refereeing it is what identified that confound.
+"""
 
 
-def bspline_segments(P: np.ndarray, closed: bool) -> np.ndarray:
+def _clamp_open(P: np.ndarray, rule: str = OPEN_END_RULE) -> np.ndarray:
+    """Extend an open control polygon past its ends according to ``rule``."""
+    if rule == TRIPLICATE:
+        return np.vstack([P[0], P[0], *P, P[-1], P[-1]])
+    if rule == DUPLICATE:
+        return np.vstack([P[0], *P, P[-1]])
+    if rule == REFLECT:
+        if len(P) < 2:
+            return np.vstack([P[0], *P, P[-1]])
+        return np.vstack([2 * P[0] - P[1], *P, 2 * P[-1] - P[-2]])
+    if rule == INTERIOR:
+        return np.asarray(P)
+    raise ValueError(f'unknown open end rule {rule!r}, want one of {OPEN_END_RULES}')
+
+
+def bspline_segments(P: np.ndarray, closed: bool, rule: str = OPEN_END_RULE) -> np.ndarray:
     """Split a control polygon into per-segment (4, 2) windows."""
-    Q = _wrap_closed(P) if closed else _clamp_open(P)
+    Q = _wrap_closed(P) if closed else _clamp_open(P, rule)
     n_seg = len(Q) - 3
+    if n_seg < 1:
+        return np.stack([Q[:4]]) if len(Q) >= 4 else np.zeros((0, 4, Q.shape[-1]))
     return np.stack([Q[i:i + 4] for i in range(n_seg)])
 
 
-def bspline_to_bezier(P: np.ndarray, closed: bool) -> np.ndarray:
+def bspline_to_bezier(P: np.ndarray, closed: bool, rule: str = OPEN_END_RULE) -> np.ndarray:
     """Exact conversion. Returns (n_seg, 4, 2) cubic Bezier control points.
 
     For one uniform cubic B-spline segment with control points P0..P3:
@@ -50,7 +91,7 @@ def bspline_to_bezier(P: np.ndarray, closed: bool) -> np.ndarray:
     Endpoints and tangents match by construction:
         S(0) = B0, S(1) = B3, S'(0) = (P2 - P0)/2 = 3(B1 - B0).
     """
-    seg = bspline_segments(np.asarray(P, dtype=np.float64), closed)
+    seg = bspline_segments(np.asarray(P, dtype=np.float64), closed, rule)
     p0, p1, p2, p3 = seg[:, 0], seg[:, 1], seg[:, 2], seg[:, 3]
     return np.stack([(p0 + 4 * p1 + p2) / 6.0,
                      (2 * p1 + p2) / 3.0,
@@ -72,10 +113,13 @@ def eval_bezier(B: np.ndarray, samples_per_seg: int = 12,
     return poly
 
 
-def eval_bspline(P: np.ndarray, closed: bool, samples_per_seg: int = 12) -> np.ndarray:
+def eval_bspline(P: np.ndarray, closed: bool, samples_per_seg: int = 12,
+                 rule: str = OPEN_END_RULE) -> np.ndarray:
     """Polyline through a uniform cubic B-spline control polygon."""
-    return eval_bezier(bspline_to_bezier(P, closed), samples_per_seg,
-                       include_end=not closed)
+    B = bspline_to_bezier(P, closed, rule)
+    if not len(B):
+        return np.asarray(P, dtype=np.float64)
+    return eval_bezier(B, samples_per_seg, include_end=not closed)
 
 
 def eval_silhouette_bezier(P: np.ndarray, closed: bool,
