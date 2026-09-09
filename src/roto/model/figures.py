@@ -193,3 +193,74 @@ def contact_sheet(rows: Sequence[dict], out_path: str | Path, title: str) -> Pat
     fig.savefig(out, dpi=140, facecolor=BACKGROUND)
     plt.close(fig)
     return out
+
+
+def worst_frame_figure(rows: Sequence[dict], out_path: str | Path, title: str) -> Path:
+    """One row per layer: the alpha, the worst frame as an overlay, a typical frame as an
+    overlay, and the layer's whole per-frame trace with its ceiling.
+
+    v1.1's figures pick a seeded random frame, which is the right default for a contact sheet
+    and the wrong one for the question the handover asks. A mean of 0.97 with a frame at 0.41
+    is a rejected shot, and the only way to know whether that frame is a real failure or a
+    thin-coverage artefact is to look at it -- next to a frame of the same layer that works,
+    and next to the trace that says whether it is one frame or a third of the track.
+
+    Artist and model are drawn *on the same axes* here rather than side by side. On a frame
+    that failed, what matters is which contour went where, and that is a comparison the eye
+    cannot make across two panels.
+    """
+    n = len(rows)
+    fig, axes = plt.subplots(n, 4, figsize=(15, 3.6 * n), facecolor=BACKGROUND,
+                             squeeze=False)
+    fig.subplots_adjust(left=0.015, right=0.985, top=1 - 0.8 / (3.6 * n + 1),
+                        bottom=0.05, wspace=0.10, hspace=0.32)
+
+    for r, row in enumerate(rows):
+        for c in range(3):
+            ax = axes[r][c]
+            ax.set_facecolor(BACKGROUND)
+            ax.set_xlim(0, row['out_px']); ax.set_ylim(row['out_px'], 0)
+            ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_color('#3a3f4b')
+
+        axes[r][0].imshow(load_alpha(row['dir'], row['worst_frame']), cmap='gray',
+                          vmin=0, vmax=1, interpolation='nearest')
+        axes[r][0].set_title(f'clean alpha — all the model is given\n{row["layer_id"]}',
+                             color='#9aa0a6', fontsize=8, loc='left', pad=4)
+
+        for col, (frame, soft, tag) in enumerate(
+                [(row['worst_frame'], row['worst_soft'], 'worst frame'),
+                 (row['typical_frame'], row['typical_soft'], 'median frame')], start=1):
+            ax = axes[r][col]
+            for xy in polylines(row['artist'], frame, row['crop']):
+                ax.plot(xy[:, 0], xy[:, 1], color=ARTIST_COLOUR, lw=0.6, alpha=0.9)
+            for xy in polylines(row['model'], frame, row['crop']):
+                ax.plot(xy[:, 0], xy[:, 1], color=MODEL_COLOUR, lw=0.6, alpha=0.9)
+            ax.set_title(f'{tag} {frame} — artist over model\nsoft IoU {soft:.4f}'
+                         f'   coverage {row[f"{tag.split()[0]}_coverage"] * 100:.1f}%',
+                         color='#e8eaed', fontsize=8, loc='left', pad=4)
+
+        ax = axes[r][3]
+        ax.set_facecolor(BACKGROUND)
+        ax.plot(row['frames'], row['soft_per_frame'], color=MODEL_COLOUR, lw=0.8)
+        if row.get('ceiling_per_frame') is not None:
+            ax.plot(row['frames'], row['ceiling_per_frame'], color=ARTIST_COLOUR, lw=0.8,
+                    alpha=0.7)
+        ax.axvline(row['worst_frame'], color='#e06c75', lw=0.8, ls=':')
+        ax.axhline(0.95, color='#9aa0a6', lw=0.6, ls='--')
+        ax.set_ylim(min(0.9, float(np.min(row['soft_per_frame'])) - 0.01), 1.005)
+        ax.tick_params(colors='#9aa0a6', labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_color('#3a3f4b')
+        below = int((np.asarray(row['soft_per_frame']) < 0.95).sum())
+        ax.set_title(f'per-frame soft IoU  ·  model, and the artist\'s own ceiling\n'
+                     f'{below} of {len(row["frames"])} frames below 0.95',
+                     color='#9aa0a6', fontsize=8, loc='left', pad=4)
+
+    fig.suptitle(title, color='#e8eaed', fontsize=12, x=0.015, ha='left',
+                 y=1 - 0.22 / (3.6 * n + 1))
+    out = Path(out_path)
+    fig.savefig(out, dpi=140, facecolor=BACKGROUND)
+    plt.close(fig)
+    return out

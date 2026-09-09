@@ -22,6 +22,22 @@ their point counts, their groups), each shape's lifespan, and the layer transfor
 network supplies the geometry; ``roto.keys`` supplies the timing. ``RebuildConfig.
 predicted_affine`` puts the transform head's own output on the table instead -- see
 ``affine_doc``.
+
+**``RebuildConfig.motion`` is the one that drops the teacher-forcing entirely**, and it is a
+different measurement from ``predicted_affine`` rather than a stronger version of it.
+``predicted_affine`` isolates the head: the artist's own control points, moved by the
+predicted track, so the number is *pure motion error* with no geometry error in front of it.
+``motion='predicted'`` asks the question the roadmap actually has to answer -- predicted
+geometry *and* predicted motion, nothing given but the shape breakdown and the lifespans.
+
+Those two are not the same number, and the reason is worth stating because it looks like it
+should cancel. Points are regressed in crop space and converted to local by inverting the
+layer matrix the renderer then re-applies, so if nothing intervened, a transform error would
+divide straight back out and the picture would be identical to the teacher-forced one. What
+intervenes is the **keyframe stage**: keys are chosen and values fitted on the *local* track,
+and inverting a wrong matrix gives a differently-shaped local track, which is sparsified
+differently. So the end-to-end cost of predicted motion is exactly what survives that
+sparsification, and it has to be measured rather than reasoned about.
 """
 from __future__ import annotations
 
@@ -46,6 +62,10 @@ from .data import LayerData, load_element
 from .geometry import crop_to_local
 from .net import RotoNet
 from .smoothing import BOXCAR, smooth_track
+
+ARTIST, PREDICTED = 'artist', 'predicted'
+MOTION_SOURCES = (ARTIST, PREDICTED)
+"""Whose layer-transform track a reconstruction is built and rendered through."""
 
 DEFAULT_TOL_PX = 1.0
 """Keyframe tolerance, in crop pixels.
@@ -102,6 +122,15 @@ class RebuildConfig:
     place, and it is a strictly cheaper change than swapping the filter."""
     predicted_affine: bool = False
     """Score the *transform head's* output instead of the artist's track. See ``affine_doc``."""
+    motion: str = ARTIST
+    """``'artist'`` teacher-forces the layer transform track, as v1 and v1.1 both do.
+    ``'predicted'`` uses the head's own track for **both** halves of the round trip -- the
+    crop-to-local conversion the keys are chosen on, and the transform the render re-applies.
+
+    That is the first de-teacher-forced number in this project, and the handover's decision
+    tree asks for it by name. It is not the same as ``predicted_affine``: see this module's
+    docstring for why the two cannot be collapsed, and why the difference is the keyframe
+    stage rather than the transform algebra."""
     supersample: int | None = None
     """Render supersample; ``None`` means the dataset's own, which is the only like-for-like
     choice. An explicit value exists so the anti-aliasing axis can be measured on purpose."""
@@ -120,6 +149,19 @@ class Reconstruction:
     key_precision: float
     key_recall: float
     key_f1: float
+    point_err_p95_px: float = 0.0
+    """The 95th percentile of per-point error, in crop pixels, over every live control point.
+
+    The mean is the number that gets quoted and the tail is the number that gets a shot
+    rejected: a layer can average 0.9 px while a hundred points sit at 5. Reported next to
+    the mean everywhere, because the two move independently -- smoothing pulls the mean down
+    and can leave the tail where it was."""
+    point_err_max_px: float = 0.0
+    """The single worst live control point in the run.
+
+    One point, so it is the noisiest statistic here and the least useful for comparing runs --
+    kept because the handover asks for max beside p95, and because the *ratio* of the two says
+    whether the tail is a population or an outlier."""
     jitter_px: float = 0.0
     """Mean frame-to-frame change in the *error* of the predicted track, in crop pixels.
 
@@ -128,13 +170,21 @@ class Reconstruction:
     be seen moving rather than inferred."""
 
     def summary(self) -> dict[str, Any]:
+        # Worst-frame counts rather than only the minimum: one bad frame in 190 is a rejected
+        # shot, so how many there are is the operational question, and a single min cannot
+        # distinguish one outlier from a bad third of the track.
         return {
             'layer_id': self.layer_id,
             'frames': int(len(self.frames)),
             'mean_soft_iou': float(self.soft_iou.mean()),
             'min_soft_iou': float(self.soft_iou.min()),
+            'p05_soft_iou': float(np.percentile(self.soft_iou, 5)),
+            'frames_below_0.95': int((self.soft_iou < 0.95).sum()),
+            'frames_below_0.90': int((self.soft_iou < 0.90).sum()),
             'mean_iou': float(self.iou.mean()),
             'point_err_px': self.point_err_px,
+            'p95_point_err_px': self.point_err_p95_px,
+            'max_point_err_px': self.point_err_max_px,
             'jitter_px': self.jitter_px,
             'keys_predicted': self.keys_predicted,
             'keys_artist': self.keys_artist,
@@ -206,15 +256,23 @@ def predict_crop_points(net: RotoNet, el: LayerData, shape_base: int = 0,
     return predict(net, el, shape_base, group_base, batch)[0]
 
 
-def to_local(el: LayerData, crop_pts: np.ndarray) -> np.ndarray:
-    """Crop-space predictions -> IR-native local normalised coordinates."""
+def to_local(el: LayerData, crop_pts: np.ndarray,
+             matrices: np.ndarray | None = None) -> np.ndarray:
+    """Crop-space predictions -> IR-native local normalised coordinates.
+
+    ``matrices`` is ``(F, S, 4, 4)`` and defaults to the artist's own composed track. Passing
+    the *predicted* track is what makes ``motion='predicted'`` a real de-teacher-forcing: the
+    same matrix has to be inverted here and re-applied by the renderer, or the two halves
+    disagree and the error is the mismatch rather than the head's.
+    """
+    mats = el.matrices if matrices is None else matrices
     out = np.zeros_like(crop_pts)
     c = el.crop
     for fi, f in enumerate(el.frames):
         off = c['offsets'][int(f)]
         for si in range(el.n_shapes):
             out[fi, si] = crop_to_local(
-                crop_pts[fi, si], el.matrices[fi, si], width=c['width'], height=c['height'],
+                crop_pts[fi, si], mats[fi, si], width=c['width'], height=c['height'],
                 offset=off, scale=c['scale'], out_px=c['out_px'])
     return out
 
@@ -254,18 +312,61 @@ def transform_matrices(el: LayerData, pred_affine: np.ndarray) -> np.ndarray:
     return matrix_from_affine(pred_affine)
 
 
+def with_transforms(doc: RotoDoc, el: LayerData, mats: np.ndarray) -> RotoDoc:
+    """Put ``mats`` ``(F, G, 4, 4)`` on every shape's transform carrier, in place.
+
+    One function for both consumers -- :func:`affine_doc` and ``motion='predicted'`` -- so
+    there is a single definition of what "render with the predicted track" means.
+
+    A shape's **carrier** is the ancestor whose transform track the group matrix is written
+    to. Two rules, and the second one is a v1.2 fix rather than a restatement:
+
+    * If an ancestor already carries a transform, that is the carrier. There must be exactly
+      one: two would each receive the group matrix and the renderer would apply it twice,
+      which still draws a plausible picture in the wrong place and would be invisible to every
+      aggregate. Asserted, not assumed.
+    * **If no ancestor carries one, the innermost ancestor becomes the carrier.** v1 and v1.1
+      skipped these shapes, and skipping them made the transform head's rendered number
+      *flattering* on exactly the layers where it matters: 338 of ``Layer_52``'s 592 shapes and
+      174 of ``mb_1``'s 473 have no transformed ancestor, so 513 of the archive's 2,753 shapes
+      were rendered at the artist's own position no matter what the head predicted for them.
+      Their target is not a no-op -- the crop-space target of an untransformed group is the
+      window's own map, which moves every frame -- so the error was real and unscored.
+
+    Writing to the innermost ancestor is only safe if that layer is not also an ancestor of a
+    shape in a *different* group, which would have one group's matrix silently move another
+    group's shapes. It holds throughout this archive and is pinned by a test.
+    """
+    for si, (ancestors, _) in enumerate(doc.shapes()):
+        g = int(el.group_of[si])
+        carriers = [l for l in ancestors if l.transform] or [ancestors[-1]]
+        assert len(carriers) == 1, \
+            f'{el.layer_id}: shape {si} has {len(carriers)} transformed ancestors; ' \
+            'replacing both would apply the group matrix twice'
+        carriers[0].transform = [Key(int(f), 'linear', mats[fi, g])
+                                 for fi, f in enumerate(el.frames)]
+    return doc
+
+
+def predicted_shape_matrices(el: LayerData, pred_affine: np.ndarray) -> np.ndarray:
+    """``(F, S, 4, 4)`` -- the predicted track fanned out per shape, as ``el.matrices`` is.
+
+    ``to_local`` inverts a per-shape matrix; the head predicts per *group*. Groups are exactly
+    the equivalence classes of identical composed tracks (``data._group_index``), so the fan-out
+    is a lookup rather than a recomposition."""
+    return transform_matrices(el, pred_affine)[:, el.group_of]
+
+
 def affine_doc(el: LayerData, pred_affine: np.ndarray) -> RotoDoc:
     """The artist's own shapes, moved by the *predicted* transform track.
 
     This is how the transform head gets a number on the table. It is trained but v1 never
     consumed it, which spends gradient on an output nobody reads.
 
-    Isolating it this way is deliberate, and the alternative is a measurement that cannot
-    say anything. Feeding predicted points *and* the predicted transform is self-cancelling:
-    the points are regressed in crop space and converted to local by inverting the same
-    matrix the renderer then re-applies, so any transform error divides out and the picture
-    is identical to the geometry-only one. Holding the artist's control points fixed and
-    varying only the transform is what makes the head's error visible in pixels.
+    Isolating it this way is deliberate, and it answers a different question from
+    ``RebuildConfig.motion='predicted'`` rather than a weaker version of the same one.
+    Holding the artist's control points fixed and varying only the transform is what makes
+    the head's error visible in pixels, with no geometry error in front of it.
 
     **Feed it the artist's own track and this must return 1.000.** It does for v1.1's
     representation and does not for v1's -- 0.9100 on ``FAM red_1`` -- which is how the 6-number
@@ -273,14 +374,7 @@ def affine_doc(el: LayerData, pred_affine: np.ndarray) -> RotoDoc:
     is that check.
     """
     doc = from_json_ir(json.loads((el.directory / 'target_ir.json').read_text()))
-    mats = transform_matrices(el, pred_affine)                  # (F, G, 4, 4)
-    for si, (ancestors, _) in enumerate(doc.shapes()):
-        g = int(el.group_of[si])
-        for layer in ancestors:
-            if layer.transform:
-                layer.transform = [Key(int(f), 'linear', mats[fi, g])
-                                   for fi, f in enumerate(el.frames)]
-    return doc
+    return with_transforms(doc, el, transform_matrices(el, pred_affine))
 
 
 def rebuild(el: LayerData, local_pts: np.ndarray,
@@ -373,26 +467,53 @@ def score_doc(el: LayerData, doc: RotoDoc, want: Sequence[int],
     return np.asarray(softs), np.asarray(hards)
 
 
-def reconstruct(layer_dir: str | Path, net: RotoNet, cfg: RebuildConfig | None = None,
-                frames: Sequence[int] | None = None, shape_base: int = 0,
-                group_base: int = 0) -> Reconstruction:
+def assemble(el: LayerData, crop_pts: np.ndarray, pred_affine: np.ndarray,
+             cfg: RebuildConfig | None = None,
+             frames: Sequence[int] | None = None) -> Reconstruction:
+    """Predictions -> keys -> a document -> pixels -> numbers. The scoring half of
+    :func:`reconstruct`, split out so it can be driven by arrays instead of a network.
+
+    That split is what lets the strongest available check exist: hand it the *artist's own*
+    control points and the artist's own transform track and every number must come out
+    perfect. Three of the four bugs v1.1 found were found that way, and the two paths added
+    here -- predicted motion, and the percentile metrics -- are checked the same way in
+    ``tests/test_v12.py`` rather than trusted.
+    """
     cfg = cfg or RebuildConfig()
-    el = load_element(layer_dir)
-    crop_pts, pred_aff = predict(net, el, shape_base, group_base)
+    if cfg.motion not in MOTION_SOURCES:
+        raise ValueError(f'unknown motion {cfg.motion!r}, want one of {MOTION_SOURCES}')
+    if cfg.motion == PREDICTED and cfg.predicted_affine:
+        raise ValueError("motion='predicted' and predicted_affine are two different "
+                         'measurements -- end-to-end, and the head alone on the artist\'s '
+                         'own points. Ask for one at a time.')
 
     mask = el.point_mask[None] & el.live[..., None, None]
     # Euclidean, in crop pixels. This was ``(|dx| + |dy|) / 2 * out_px``, which is neither
     # L1 nor L2 and reads low against the distance an artist would measure.
     err = np.linalg.norm(crop_pts - el.points, axis=-1)[mask] * el.out_px
-    point_err = float(err.mean())
+    point_err, p95 = float(err.mean()), float(np.percentile(err, 95))
+    pmax = float(err.max()) if err.size else 0.0
     jitter = track_jitter(crop_pts, el.points, el.live, el.point_mask, el.out_px)
 
-    local = to_local(el, crop_pts)
-    doc, kstats = rebuild(el, local, cfg)
+    # The keys are chosen on the local track, so which matrix is inverted here is part of
+    # the de-teacher-forcing rather than a detail of it -- see the module docstring.
+    mats = predicted_shape_matrices(el, pred_affine) if cfg.motion == PREDICTED else None
+    doc, kstats = rebuild(el, to_local(el, crop_pts, mats), cfg)
+    if cfg.motion == PREDICTED:
+        doc = with_transforms(doc, el, transform_matrices(el, pred_affine))
     if cfg.predicted_affine:
-        doc = affine_doc(el, pred_aff)
+        doc = affine_doc(el, pred_affine)
 
     want = list(frames) if frames is not None else [int(f) for f in el.frames]
     softs, hards = score_doc(el, doc, want, cfg.supersample)
     return Reconstruction(el.layer_id, doc, np.asarray(want), softs, hards,
-                          point_err, jitter_px=jitter, **kstats)
+                          point_err, point_err_p95_px=p95, point_err_max_px=pmax,
+                          jitter_px=jitter, **kstats)
+
+
+def reconstruct(layer_dir: str | Path, net: RotoNet, cfg: RebuildConfig | None = None,
+                frames: Sequence[int] | None = None, shape_base: int = 0,
+                group_base: int = 0) -> Reconstruction:
+    el = load_element(layer_dir)
+    crop_pts, pred_aff = predict(net, el, shape_base, group_base)
+    return assemble(el, crop_pts, pred_aff, cfg, frames)

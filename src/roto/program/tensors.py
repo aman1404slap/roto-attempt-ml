@@ -10,9 +10,13 @@ Four measured facts shape the representation:
 * **Layer transforms are projective, not affine** -- row 2 and column 2 are always
   ``[0,0,1,0]``, but column 3 is *not* always ``[0,0,0,1]``. So a track is 8 numbers per frame
   (a normalised 2D homography), not 6 and not 16. Similarity covers most layers but not all:
-  two carry shear and two carry perspective. See :func:`proj_from_matrix` -- the 6-number
-  affine form this module shipped with is measured to be lossy on those two layers, by 23.8
-  crop px at worst, and is kept only so v1's numbers reproduce.
+  two carry shear and two carry perspective. See :func:`proj_from_matrix`.
+
+  ``ProgramTensors.transform`` carries those 8 numbers as of v1.2. It carried
+  :func:`affine_from_matrix`'s 6 through v1 and v1.1, which meant the round trip at the top of
+  this docstring *did not hold* on the two perspective layers -- by 350 crop px on one of
+  them. ``affine_from_matrix`` is kept, and kept documented as lossy, only so that v1's
+  transform-head numbers still reproduce.
 * **Transforms are shared per shape group, not per shape.** The 2753 shapes in this archive
   resolve to 208 distinct tracks. Predicting per shape would be a redundant target and would
   let the model disagree with itself about the motion of one rigid group.
@@ -171,13 +175,26 @@ class ProgramTensors:
     key_interp: list[list[str]]  # per shape, per slot
     key_mask: np.ndarray     # (S, Tk) bool -- is this frame a key for this shape
     live_mask: np.ndarray    # (S, Tk) bool -- opacity non-zero (lossless: opacity is binary)
-    affine: np.ndarray       # (G, Tk, 6) float32 -- one track per shape group
+    transform: np.ndarray    # (G, Tk, 8) float32 -- one projective track per shape group
+    """The layer transform track, as ``PROJ_DOF`` numbers per frame.
+
+    **This was 6 numbers -- ``affine_from_matrix`` -- through v1 and v1.1, and it was wrong.**
+    The module header has said since v1.1 that these transforms are projective and that the
+    6-number form is lossy on two layers; the header said it while this field still carried
+    it, so ``decode(encode(program))`` did not round trip on those two layers. Measured on the
+    archive's own matrices, the 6-number form displaces a planar point by up to 0.086
+    normalised units on ``FAM red_1`` and **1.564 on ``Layer_52``** -- 350 crop px, a shape
+    rendered off its own crop -- while the 8-number form is exact to 7e-16.
+
+    It survived because the round-trip test covers ``nfl_0200 blue``, whose track *is* affine,
+    so the case that fails was the case not sampled. ``scripts/ledger.py`` walks the
+    perspective layers instead, which is how it was found."""
 
     def copy(self) -> ProgramTensors:
         return ProgramTensors(self.points.copy(), self.key_slot_mask.copy(),
                               self.key_frames.copy(), [list(r) for r in self.key_interp],
                               self.key_mask.copy(), self.live_mask.copy(),
-                              self.affine.copy())
+                              self.transform.copy())
 
 
 PAD_FRAME = -32768
@@ -267,7 +284,7 @@ def load_program(layer_dir: str | Path) -> tuple[ProgramSpec, ProgramTensors, di
         live_mask[i, a + len(live):] = live[-1] if len(live) else False
 
     tensors = ProgramTensors(points, slot, kf, interp, key_mask, live_mask,
-                             affine_from_matrix(tracks).astype(np.float32))
+                             proj_from_matrix(tracks).astype(np.float32))
     return spec, tensors, meta
 
 
@@ -304,7 +321,7 @@ def decode(layer_dir: str | Path, spec: ProgramSpec, pred: ProgramTensors) -> Ro
     d = Path(layer_dir)
     doc = read_json_ir(d / 'target_ir.json')
     axis = spec.key_axis
-    mats = matrix_from_affine(pred.affine)                  # (G, Tk, 4, 4)
+    mats = matrix_from_proj(pred.transform)                 # (G, Tk, 4, 4)
 
     shapes = [s for _, s in doc.shapes()]
     if len(shapes) != spec.n_shapes:

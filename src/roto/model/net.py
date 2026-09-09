@@ -53,6 +53,15 @@ they did.
 same reason ``in_frames`` is: a model trained on neighbour alphas warped into the anchor's
 crop window must be *given* them warped at inference, and a mismatch would surface as a
 mysterious quality loss rather than an error. See ``roto.model.data.LayerData.window``.
+
+**The transform head already owns its decoder, and ``affine_depth`` is how deep.** The group
+queries run through ``gblocks`` -- their own stack of cross-attention blocks, never shared
+with the shape queries; only the encoder is shared. So "give the head its own decoder" was
+already true in v1, which matters when reading the v1.1 handover: what the head did *not*
+have was a depth of its own, fixed at ``depth`` alongside the point decoder. ``affine_depth``
+separates them so more capacity can be spent on motion without touching the geometry path.
+``None`` means ``depth``, which is exactly v1 and v1.1, so every existing checkpoint loads
+and scores unchanged.
 """
 from __future__ import annotations
 
@@ -151,11 +160,12 @@ class RotoNet(nn.Module):
     def __init__(self, max_shapes: int, max_groups: int, max_points: int,
                  max_coords: int, dim: int = 192, depth: int = 3,
                  in_frames: int = 1, self_attn: bool = False, affine_dim: int = 6,
-                 align_window: bool = False) -> None:
+                 align_window: bool = False, affine_depth: int | None = None) -> None:
         super().__init__()
         self.max_points, self.max_coords = max_points, max_coords
         self.in_frames, self.self_attn = in_frames, self_attn
         self.affine_dim, self.align_window = affine_dim, align_window
+        self.affine_depth = int(affine_depth or depth)
         self.encoder = AlphaEncoder(dim, in_frames)
         self.shape_bank = nn.Embedding(max_shapes, dim)
         self.group_bank = nn.Embedding(max_groups, dim)
@@ -163,7 +173,7 @@ class RotoNet(nn.Module):
         self.blocks = nn.ModuleList([CrossBlock(dim) for _ in range(depth)])
         self.sblocks = nn.ModuleList([SelfBlock(dim) for _ in range(depth)]) \
             if self_attn else None
-        self.gblocks = nn.ModuleList([CrossBlock(dim) for _ in range(depth)])
+        self.gblocks = nn.ModuleList([CrossBlock(dim) for _ in range(self.affine_depth)])
         self.point_head = nn.Sequential(
             nn.LayerNorm(dim), nn.Linear(dim, dim * 2), nn.GELU(),
             nn.Linear(dim * 2, max_points * max_coords * 2))

@@ -111,6 +111,16 @@ class TrainConfig:
     test. Only meaningful when ``in_frames > 1``."""
     self_attn: bool = False
     """Self-attention among shape queries. See ``net.SelfBlock``."""
+    affine_depth: int = 0
+    """Depth of the transform head's own decoder. ``0`` means ``depth``, which is v1's.
+
+    The v1.1 handover's decision tree says that if the crop-space head still falls short,
+    "give the head its own small decoder depth before giving up". It already has its own
+    decoder -- ``net.RotoNet.gblocks`` is a separate cross-attention stack, sharing only the
+    encoder -- so what this knob actually tests is whether the head is *capacity*-limited,
+    and the alternative hypothesis is that it is schedule-limited like everything else here:
+    at 40k the transform term is still falling (0.858 crop px and descending, ``final_long_v2``).
+    Measured as one rung rather than argued."""
     curve_weight: float = 0.0
     """Weight on the polyline term, relative to the point term. 0.5 was the starting point;
     the point term is kept because it is what pins down a control polygon the artist can edit,
@@ -386,11 +396,13 @@ def train(dataset_root: str | Path, out_dir: str | Path,
           f'Pmax {max_points} Cmax {max_coords} | {device} | window {cfg.in_frames}'
           f'{" aligned" if cfg.align_window and cfg.in_frames > 1 else ""} '
           f'| self-attn {cfg.self_attn} | sampling {cfg.sampling} '
-          f'| transform {cfg.affine_space} ({affine_dim}-dof)')
+          f'| transform {cfg.affine_space} ({affine_dim}-dof'
+          f'{f", decoder depth {cfg.affine_depth}" if cfg.affine_depth else ""})')
 
     net = RotoNet(max_shapes, max_groups, max_points, max_coords, cfg.dim, cfg.depth,
                   in_frames=cfg.in_frames, self_attn=cfg.self_attn,
-                  affine_dim=affine_dim, align_window=cfg.align_window).to(device)
+                  affine_dim=affine_dim, align_window=cfg.align_window,
+                  affine_depth=cfg.affine_depth or None).to(device)
     n_params = sum(p.numel() for p in net.parameters())
     maps = {e.layer_id: PolylineMaps(e.n_points_per_shape, e.closed_per_shape,
                                      e.coords_per_shape, device)
@@ -399,6 +411,8 @@ def train(dataset_root: str | Path, out_dir: str | Path,
         print(f'  curve loss covers {sum(m.n_shapes_covered for m in maps.values())} '
               f'of {max_shapes} shapes (Bezier and <3-point shapes sit out)')
 
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
     opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / cfg.warmup)
@@ -440,7 +454,7 @@ def train(dataset_root: str | Path, out_dir: str | Path,
                   else f'  affine {row["affine"]:.5f}')
             print(f'  step {row["step"]:>5}  point {row["point_px"]:7.3f}px'
                   f'{extra}{tr}  total {row["total"]:7.3f}  '
-                  f'[{row["elapsed_s"]:.0f}s]')
+                  f'[{row["elapsed_s"]:.0f}s]', flush=True)
 
     ckpt = {
         'state_dict': {k: v.cpu() for k, v in net.state_dict().items()},
@@ -448,7 +462,8 @@ def train(dataset_root: str | Path, out_dir: str | Path,
                  'max_points': max_points, 'max_coords': max_coords,
                  'dim': cfg.dim, 'depth': cfg.depth,
                  'in_frames': cfg.in_frames, 'self_attn': cfg.self_attn,
-                 'affine_dim': affine_dim, 'align_window': cfg.align_window},
+                 'affine_dim': affine_dim, 'align_window': cfg.align_window,
+                 'affine_depth': net.affine_depth},
         'config': asdict(cfg),
         'layers': [e.layer_id for e in els],
         'shape_base': shape_base,
@@ -458,13 +473,24 @@ def train(dataset_root: str | Path, out_dir: str | Path,
         'n_params': n_params,
     }
     torch.save(ckpt, out / 'model.pt')
+    wall = time.time() - t0
+    # What the run cost, on the record. The handover asks local-versus-cloud as a capability
+    # question; these two numbers are the whole of the local side of that answer.
+    peak_mb = (torch.cuda.max_memory_allocated(device) / 2 ** 20
+               if device.type == 'cuda' else None)
     summary = {'n_params': n_params, 'steps': cfg.steps, 'layers': len(els),
                'frames': sum(len(e.frames) for e in els), 'frames_held_out': n_held,
-               'device': str(device), 'config': asdict(cfg),
-               'wall_clock_s': round(time.time() - t0, 1),
+               'device': str(device),
+               'device_name': (torch.cuda.get_device_name(device)
+                               if device.type == 'cuda' else None),
+               'peak_gpu_mb': round(peak_mb, 1) if peak_mb is not None else None,
+               'steps_per_s': round(cfg.steps / wall, 2) if wall else None,
+               'config': asdict(cfg),
+               'wall_clock_s': round(wall, 1),
                'final': state.history[-1] if state.history else {},
                'history': state.history}
     (out / 'train_log.json').write_text(json.dumps(summary, indent=2))
     print(f'\nsaved {out / "model.pt"}  ({n_params/1e6:.2f}M params, '
-          f'{summary["wall_clock_s"]:.0f}s)')
+          f'{summary["wall_clock_s"]:.0f}s, {summary["steps_per_s"]:.1f} steps/s'
+          f'{f", peak {peak_mb:.0f} MB" if peak_mb is not None else ""})')
     return summary

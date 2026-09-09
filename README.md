@@ -40,6 +40,16 @@ to build v2 on. See [v1.1/OVERVIEW.md](v1.1/OVERVIEW.md),
 [v1.1/review-response.md](v1.1/review-response.md) and
 [v1.1/v1.1-review-response.md](v1.1/v1.1-review-response.md).
 
+v1.2 answers the handover written after v1.1 ([v1.1-to-v1.2-plan.md](v1.1-to-v1.2-plan.md)),
+which asks for something other than a better number: split every pixel of disagreement into
+**pipeline error**, which must be provably zero, and **model error**, which is minimised and
+reported *worst case*. It is a measurement round and it proposes no new headline model. What it
+established: the run-to-run noise floor is **±0.0069 soft IoU at 12k**, larger than most
+differences v1.1's ladder reports; the exactness ledger has 15 rows and found two that were
+silently wrong; and dropping the teacher-forced motion track entirely costs **0.0049** end to
+end, not the 0.043 the head's own isolated number implies. See [v1.2/OVERVIEW.md](v1.2/OVERVIEW.md)
+and [v1.2/plan-response.md](v1.2/plan-response.md).
+
 The aggregate is the least informative number in that table. **The two layers that were broken
 went 0.7316 → 0.9533 and 0.7739 → 0.9614**, exactly as the v1 review predicted they would when
 it named shape-query collision as the cause; the mean moved only +0.051 because eight of the
@@ -121,18 +131,23 @@ scripts/           eval_keys.py, report_v1.py, and the v1.1 set:
                    sweep_operating_point.py, fig_worst_layers.py,
                    exp_conventions.py, exp_peak_frames.py,
                    exp_offset_jitter.py, exp_affine_target.py
-tests/             100 tests
+                   ...and the v1.2 set: ledger.py (the exactness ledger),
+                   train_v12.py / report_v12.py / summarise_v12.py,
+                   exp_scoring_ceiling.py, exp_noise_floor.py, fig_worst_frames.py
+tests/             123 tests
 v1/                deliverables (gitignored): docs, checkpoint, results, figures
 v1.1/              same, for the review response: ladder, sweeps, referees
+v1.2/              same, for the handover: the ledger, the noise floor, worst-case tables
 ```
 
 ## Tests
 
 ```bash
-pytest            # 100 tests, ~75s — they render real archive frames
+pytest                    # 123 tests, ~85s — they render real archive frames
+python scripts/ledger.py  # the exactness ledger; exits non-zero if a row is red
 ```
 
-Three carry the most weight:
+Four carry the most weight:
 
 - **`test_dataset.py`** asserts `decode(encode(program))` renders back to the layer's own
   matte, at strides 1, 7 and 20. Tolerance is `1e-4`, which is 16-bit PNG quantisation on the
@@ -143,6 +158,11 @@ Three carry the most weight:
   the pipeline shipped with is *lossy* on a perspective transform, and that the 8-number
   projective form replacing it is exact. That asymmetry was a real ceiling on a real head, and
   a test is the only thing that stops it coming back.
+- **`test_v12.py`** checks the two conversions nothing was watching — that window alignment uses
+  the offsets the targets were built with, and that the transform loss's probe points land where
+  the renderer puts them, both to 1e-9 crop px on the real archive. It also pins the
+  de-teacher-forcing path the only way that means anything: hand it the artist's own transform
+  track and it must reproduce the teacher-forced reconstruction exactly.
 
 ## Not in scope yet
 
