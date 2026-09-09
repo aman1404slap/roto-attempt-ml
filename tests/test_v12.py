@@ -345,7 +345,7 @@ def test_affine_depth_is_independent_and_v1_arch_still_builds():
     alpha = torch.zeros(2, 1, 256, 256)
     ids = torch.arange(8)[None].expand(2, -1)
     gids = torch.arange(2)[None].expand(2, -1)
-    pts, aff = deep(alpha, ids, gids, torch.zeros(2, 8, 3))
+    pts, aff, key = deep(alpha, ids, gids, torch.zeros(2, 8, 3))
     assert pts.shape == (2, 8, 6, 1, 2) and aff.shape == (2, 2, 6)
 
 

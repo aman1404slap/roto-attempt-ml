@@ -74,7 +74,7 @@ def main() -> None:
     dirs = sorted(p for p in Path(args.dataset).iterdir() if (p / 'meta.json').exists())
     for d in dirs:
         el = load_element(d)
-        crop_pts, _ = predict(net, el, sbase.get(d.name, 0), gbase.get(d.name, 0))
+        crop_pts, _, _ = predict(net, el, sbase.get(d.name, 0), gbase.get(d.name, 0))
         local = to_local(el, crop_pts)
         vel = frame_velocity(el)
         k = max(1, int(round(len(vel) * args.decile)))

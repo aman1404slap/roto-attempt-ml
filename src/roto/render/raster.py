@@ -130,6 +130,63 @@ def measured_conventions(supersample: int = 4) -> RenderConfig:
                         fill_open_zero_width=False, open_end_rule=DUPLICATE)
 
 
+V1_CONVENTIONS, MEASURED_CONVENTIONS = 'v1', 'measured'
+CONVENTION_SETS = (V1_CONVENTIONS, MEASURED_CONVENTIONS)
+
+
+def conventions(name: str, supersample: int) -> RenderConfig:
+    """The named convention set at a given supersample. One place both callers agree on."""
+    if name == MEASURED_CONVENTIONS:
+        return measured_conventions(supersample)
+    if name == V1_CONVENTIONS:
+        return RenderConfig(supersample=supersample)
+    raise ValueError(f'unknown conventions {name!r}, want one of {CONVENTION_SETS}')
+
+
+def config_from_meta(render_meta: dict, supersample: int | None = None) -> RenderConfig:
+    """The ``RenderConfig`` a dataset's alphas were **actually drawn with**, from its own
+    ``meta.json``, with the recorded flags *verified* rather than trusted.
+
+    This function exists because of a bug the v002 rebuild exposed, and the shape of that bug
+    is worth keeping written down. Every scoring path in v1, v1.1 and v1.2 rendered with
+    ``RenderConfig(supersample=meta['render']['supersample'])`` -- carrying one convention
+    across from the dataset and silently reasserting the *class defaults* for the other three.
+    That was invisible for two rounds because ``datasets/v001`` was built with v1's
+    conventions, and v1's conventions **are** the defaults, so the omission could not produce
+    a wrong number. Flip the dataset to the measured set and it can: the artist's own program,
+    scored against its own alphas, reads 0.9925 on ``FAM blue_1`` and 0.9887 on ``green_2``
+    -- the two layers with hundreds of open strokes -- purely because the scorer filled open
+    zero-width shapes that the dataset had stroked, and stroked them at a different width.
+    With the conventions read back, both are 1.000000.
+
+    So the lesson generalises past this fix: a convention that lives in a *default* is a
+    convention two independent code paths can disagree about while both look right. The
+    conventions now travel with the data, and the requirement is checked here so that a
+    dataset whose record disagrees with any convention set is an error rather than a
+    re-baseline nobody notices.
+
+    ``supersample`` overrides the recorded one, which is the one axis a caller legitimately
+    varies (``RebuildConfig.supersample`` exists so anti-aliasing can be measured on purpose).
+    Everything else comes from the record.
+    """
+    name = render_meta.get('conventions', V1_CONVENTIONS)
+    ss = int(supersample if supersample else render_meta.get('supersample', 2))
+    cfg = conventions(name, ss)
+    for field, recorded in (('fill_open_zero_width', render_meta.get('fill_open_zero_width')),
+                            ('open_end_rule', render_meta.get('open_end_rule')),
+                            ('samples_per_seg', render_meta.get('samples_per_seg')),
+                            ('clip_per_shape', render_meta.get('clip_per_shape'))):
+        if recorded is None:                       # older meta.json: the field predates it
+            continue
+        got = getattr(cfg, field)
+        if got != recorded:
+            raise ValueError(
+                f"dataset records conventions={name!r} with {field}={recorded!r}, but that "
+                f'set has {field}={got!r}. The record and the code disagree about how these '
+                'alphas were drawn; do not score against them until it is resolved.')
+    return cfg
+
+
 def trs_matrix(trs: dict[str, list[Key]], frame: float) -> np.ndarray | None:
     """Anchor/scale/rotate/position tracks -> one 4x4, or ``None`` when identity.
 

@@ -62,10 +62,48 @@ def run_totals(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         'keys_predicted': int(sum(r['keys_predicted'] for r in rows)),
         'keys_artist': int(sum(r['keys_artist'] for r in rows)),
         'key_f1': av('key_f1', kw),
+        # Quoted with the key F1 everywhere: see Reconstruction.key_f1_over_random.
+        'baseline_pipeline_key_f1_random': (
+            av('baseline_pipeline_key_f1_random', kw)
+            if any('baseline_pipeline_key_f1_random' in r for r in rows) else 0.0),
+        'key_f1_over_random': (av('key_f1_over_random', kw)
+                               if any('key_f1_over_random' in r for r in rows) else 0.0),
+        'key_f1_strict': (av('key_f1_strict', kw)
+                          if any('key_f1_strict' in r for r in rows) else 0.0),
+        'shapes_with_no_in_range_key': int(sum(r.get('shapes_with_no_in_range_key', 0)
+                                               for r in rows)),
+        # The key-timing head scored on its own, beside the keys the DP actually chose. Both,
+        # because they can move in opposite directions and the difference says whether the
+        # bias is set too low or is doing damage. Zero for a checkpoint with no key head.
+        'head_key_f1': av('head_key_f1', kw) if any('head_key_f1' in r for r in rows) else 0.0,
+        'head_key_precision': (av('head_key_precision', kw)
+                               if any('head_key_precision' in r for r in rows) else 0.0),
+        'head_key_recall': (av('head_key_recall', kw)
+                            if any('head_key_recall' in r for r in rows) else 0.0),
+        # Never aggregated without them: see Reconstruction.head_key_f1_over_best_baseline.
+        'baseline_key_f1_all_live': (av('baseline_key_f1_all_live', kw)
+                                     if any('baseline_key_f1_all_live' in r for r in rows)
+                                     else 0.0),
+        'baseline_key_f1_random': (av('baseline_key_f1_random', kw)
+                                   if any('baseline_key_f1_random' in r for r in rows)
+                                   else 0.0),
+        'head_key_f1_over_best_baseline': (av('head_key_f1_over_best_baseline', kw)
+                                           if any('head_key_f1_over_best_baseline' in r
+                                                  for r in rows) else 0.0),
+        'key_tol_min': min((r.get('key_tol_min', 0.0) for r in rows), default=0.0),
+        'key_tol_max': max((r.get('key_tol_max', 0.0) for r in rows), default=0.0),
         'per_layer': list(rows),
     }
     tot['key_ratio'] = tot['keys_predicted'] / max(1, tot['keys_artist'])
     tot['frames_below_0.95_pct'] = 100.0 * tot['frames_below_0.95'] / max(1, tot['frames'])
+    tot['frames_below_0.90_pct'] = 100.0 * tot['frames_below_0.90'] / max(1, tot['frames'])
+    # The *worst layer's* share, not the run's. A gate of "frames below 0.90 <= 1% per layer"
+    # is a per-layer statement and a run-level percentage can pass it while one layer fails
+    # badly: 1% of 1,810 frames is 18, which one 77-frame layer could supply entirely.
+    worst_pct = max(rows, key=lambda r: r['frames_below_0.90'] / max(1, r['frames']))
+    tot['worst_layer_frames_below_0.90_pct'] = (
+        100.0 * worst_pct['frames_below_0.90'] / max(1, worst_pct['frames']))
+    tot['worst_layer_frames_below_0.90'] = worst_pct['layer_id']
 
     # The held-out split, where a run has one. Weighted by held frames, not by all frames:
     # the question is how the withheld frames scored, and the trained column is there only
@@ -79,6 +117,34 @@ def run_totals(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         tot['held_gap'] = tot['train_soft_iou'] - tot['held_soft_iou']
         tot['held_frames'] = int(hw.sum())
     return tot
+
+
+def by_training_status(rows: Sequence[dict[str, Any]],
+                       withheld: Sequence[str]) -> dict[str, Any]:
+    """Aggregate a run three ways: the layers it trained on, the ones it did not, and all.
+
+    v1.3 is the first round where a run is scored on layers it was never allowed to train on,
+    and one aggregate cannot carry both. The **trained** block is the headline and is what the
+    acceptance gates read, because a gate like "every layer >= 0.90" is a statement about
+    reconstruction quality and a layer with freshly initialised query rows is not a
+    reconstruction -- it is a measurement of the encoder with the memorisation capacity set to
+    zero (``reconstruct.untrained_queries``). The **held_layers** block is that measurement,
+    kept apart so it can never dilute the headline or be mistaken for a generalisation claim.
+    The **all_layers** block exists only so a v002 row can still be read against v1.1's
+    thirteen-layer tables.
+
+    ``withheld`` comes from the *checkpoint*, not from the dataset: the dataset says which
+    layers its split withholds, and a run may have opted out (``TrainConfig.use_split``), so
+    only the checkpoint knows what a given run actually saw.
+    """
+    held = set(withheld)
+    trained = [r for r in rows if r['layer_id'] not in held]
+    frozen = [r for r in rows if r['layer_id'] in held]
+    out = dict(run_totals(trained if trained else rows))
+    out['withheld_layers'] = sorted(held)
+    out['all_layers'] = run_totals(rows) if frozen else None
+    out['held_layers'] = run_totals(frozen) if frozen else None
+    return out
 
 
 def spread(runs: Sequence[dict[str, Any]], keys: Sequence[str]) -> dict[str, Any]:

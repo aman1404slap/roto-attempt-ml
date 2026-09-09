@@ -23,7 +23,7 @@ from matplotlib.figure import Figure
 
 from ..dataset import load_alpha
 from ..ir import RotoDoc, opacity_at
-from ..render.raster import RenderConfig, shape_polyline
+from ..render.raster import RenderConfig, config_from_meta, shape_polyline
 
 ARTIST_COLOUR = '#4dd0e1'
 MODEL_COLOUR = '#ffb74d'
@@ -40,7 +40,10 @@ def polylines(doc: RotoDoc, frame: int, crop: dict, cfg: RenderConfig | None = N
     mapping here is the obvious shortcut and would make the figure quietly disagree with the
     IoU printed beside it.
     """
-    cfg = cfg or RenderConfig(supersample=1)
+    # The conventions the *dataset* was drawn with, not the class defaults: ``open_end_rule``
+    # decides how an open B-spline is extended past its ends, and a figure drawn under the
+    # wrong rule disagrees with the IoU printed beside it wherever a stroke ends.
+    cfg = cfg or config_from_meta(crop.get('render', {}), supersample=1)
     x0, y0 = crop['offsets'][int(frame)]
     scale = crop['scale']
     ox = (crop['width'] / 2.0 - x0) * scale

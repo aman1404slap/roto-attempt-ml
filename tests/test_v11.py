@@ -171,7 +171,7 @@ def test_network_accepts_a_temporal_window_and_v1_arch_still_builds():
     for in_frames, self_attn in [(1, False), (3, False), (3, True)]:
         net = RotoNet(10, 2, 6, 1, dim=32, depth=1, in_frames=in_frames,
                       self_attn=self_attn)
-        pts, aff = net(torch.rand(2, in_frames, 256, 256), torch.arange(4)[None].expand(2, -1),
+        pts, aff, _ = net(torch.rand(2, in_frames, 256, 256), torch.arange(4)[None].expand(2, -1),
                        torch.arange(2)[None].expand(2, -1), torch.rand(2, 4, 3))
         assert pts.shape == (2, 4, 6, 1, 2) and aff.shape == (2, 2, 6)
 
@@ -184,15 +184,15 @@ def test_self_attention_lets_one_query_change_another():
     # left that way it emits 0.5 for every query and would hide the wiring under test.
     torch.nn.init.normal_(net.point_head[-1].weight, std=0.02)
     alpha, gid, desc = torch.rand(1, 1, 256, 256), torch.arange(2)[None], torch.rand(1, 3, 3)
-    a, _ = net(alpha, torch.tensor([[0, 1, 2]]), gid, desc)
-    b, _ = net(alpha, torch.tensor([[0, 1, 5]]), gid, desc)     # change the third query only
+    a, _, _ = net(alpha, torch.tensor([[0, 1, 2]]), gid, desc)
+    b, _, _ = net(alpha, torch.tensor([[0, 1, 5]]), gid, desc)  # change the third query only
     assert not torch.allclose(a[0, 0], b[0, 0], atol=1e-6), \
         'query 0 did not react to a change in query 2 -- self-attention is not wired in'
 
     flat = RotoNet(10, 2, 6, 1, dim=32, depth=1, self_attn=False).eval()
     torch.nn.init.normal_(flat.point_head[-1].weight, std=0.02)
-    c, _ = flat(alpha, torch.tensor([[0, 1, 2]]), gid, desc)
-    d, _ = flat(alpha, torch.tensor([[0, 1, 5]]), gid, desc)
+    c, _, _ = flat(alpha, torch.tensor([[0, 1, 2]]), gid, desc)
+    d, _, _ = flat(alpha, torch.tensor([[0, 1, 5]]), gid, desc)
     assert torch.allclose(c[0, 0], d[0, 0], atol=1e-6), \
         'without self-attention a query must be unable to see any other -- that was v1'
 
@@ -243,6 +243,10 @@ class _FakeLayer:
     def __init__(self, n):
         self.layer_id = 'fake'
         self.frames = np.arange(n)
+        # Empty as of v1.3: ``split`` prefers a split the *dataset* recorded and falls back
+        # to the rule when there is none, which is the path this fixture is testing.
+        self.split_train = np.zeros(0, np.int64)
+        self.split_held = np.zeros(0, np.int64)
         self._a = np.arange(n, dtype=np.float32)[:, None, None] * np.ones((1, 4, 4), np.float32)
 
     @property
@@ -395,7 +399,7 @@ def test_group_probes_span_the_groups_own_points_and_ignore_dead_frames():
 def test_transform_head_width_follows_the_target_and_v1_checkpoints_still_load():
     for dof in (6, 8):
         net = RotoNet(10, 3, 6, 1, dim=32, depth=1, affine_dim=dof)
-        _, aff = net(torch.rand(2, 1, 256, 256), torch.arange(4)[None].expand(2, -1),
+        _, aff, _ = net(torch.rand(2, 1, 256, 256), torch.arange(4)[None].expand(2, -1),
                      torch.arange(3)[None].expand(2, -1), torch.rand(2, 4, 3))
         assert aff.shape == (2, 3, dof)
     assert RotoNet(10, 3, 6, 1, dim=32, depth=1).affine_dim == 6, 'v1 default must stay 6'

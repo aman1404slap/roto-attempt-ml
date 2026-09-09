@@ -56,7 +56,7 @@ from ..keys import f1 as key_f1
 from ..keys import select
 from ..keys.refit import refit_key_values
 from ..program import PROJ_DOF, matrix_from_affine, matrix_from_proj
-from ..render.raster import RenderConfig, render_union
+from ..render.raster import config_from_meta, render_union
 from ..sfx.json_ir import from_json_ir
 from .data import LayerData, load_element
 from .geometry import crop_to_local
@@ -134,6 +134,28 @@ class RebuildConfig:
     supersample: int | None = None
     """Render supersample; ``None`` means the dataset's own, which is the only like-for-like
     choice. An explicit value exists so the anti-aliasing axis can be measured on purpose."""
+    key_bias: float = 0.0
+    """How far the key-timing head may tighten the DP's tolerance locally. ``0`` is v1.2.
+
+    This is the head's *only* route into the output. See ``keys.dp.local_tolerances`` for the
+    form and ``keys.dp``'s header for why the head is not allowed to emit a key directly:
+    over-keying is this project's measured signature failure, and a bias on a minimising
+    objective cannot cause it because every extra knot still costs."""
+    key_slack: float = 0.0
+    """How far the head may *loosen* the DP's tolerance where it expects no key.
+
+    The other half of ``key_bias``, and the half that can raise precision -- which is the
+    binding constraint on key F1, since this project's measured failure is over-keying at
+    precision 0.21-0.44 against recall 0.75-1.00. Tightening alone can only add keys;
+    loosening is what lets the pair move keys without moving the key count, and the key count
+    has to stay inside an editable economy. ``0`` is the one-sided form. See
+    ``keys.dp.local_tolerances``."""
+    key_thresh: float = 0.5
+    """Threshold at which the head's *own* key set is read off, for reporting only.
+
+    Nothing downstream uses it -- the DP sees the probability, not a decision. It exists so
+    the head can be scored on its own terms beside the pipeline it feeds, which is the only
+    way to tell a head that learned nothing from a bias that was set too low."""
 
 
 @dataclass(slots=True)
@@ -149,6 +171,26 @@ class Reconstruction:
     key_precision: float
     key_recall: float
     key_f1: float
+    key_f1_strict: float = 0.0
+    """``key_f1`` with the out-of-live-range artist keys **excluded** rather than clipped.
+
+    7.91% of this archive's 24,335 artist keys sit outside their own shape's live range, and
+    half of all shapes have at least one. ``rebuild`` always forces a knot at the first and
+    last live frame, so a key clipped onto that boundary is matched for free -- worth 0.009 to
+    0.040 key F1 per layer, which is the size of difference this project argues about (v1.2's
+    constrained operating point was worth +0.026). ``key_f1`` keeps the clipped definition
+    unchanged, because every number in v1, v1.1 and v1.2 used it and the plan's >= 0.42 gate
+    was set against one of them. This is the one without the free credit."""
+    shapes_with_no_in_range_key: int = 0
+    baseline_pipeline_key_f1_random: float = 0.0
+    key_f1_over_random: float = 0.0
+    """``key_f1`` minus what the *same number of keys* placed at random would have scored.
+
+    Not decoration, and not the same argument as the key-economy column. Key F1 with a
+    one-frame matching tolerance is close to saturated by keying often, and the two
+    densest-keyed layers in this archive carry 40% of its keys, so the aggregate is dominated
+    by the layers where a high score is cheapest. Every key F1 in v1, v1.1 and v1.2 was quoted
+    without this control; it is added here because v1.3's acceptance gate reads that number."""
     point_err_p95_px: float = 0.0
     """The 95th percentile of per-point error, in crop pixels, over every live control point.
 
@@ -162,6 +204,31 @@ class Reconstruction:
     One point, so it is the noisiest statistic here and the least useful for comparing runs --
     kept because the handover asks for max beside p95, and because the *ratio* of the two says
     whether the tail is a population or an outlier."""
+    head_key_precision: float = 0.0
+    head_key_recall: float = 0.0
+    head_key_f1: float = 0.0
+    baseline_key_f1_all_live: float = 0.0
+    baseline_key_f1_random: float = 0.0
+    head_key_f1_over_best_baseline: float = 0.0
+    """The head's matched key F1 **minus the better of two trivial baselines**: firing on
+    every live frame, and firing on a random subset of the same size.
+
+    This is the only one of the three that is a statement about the head, and it exists
+    because the raw figure is not. Key density ranges 13x across these layers, so a head that
+    learns nothing but each layer's base rate scores well: on the 12k probe, ``Layer_52`` read
+    0.803 matched F1 against **0.797 for firing on every live frame**, while ``FAM blue`` --
+    density 0.057 against Layer_52's 0.474 -- stopped firing at all and read 0.017. The head
+    had learned the spread across layers and nothing inside any of them. Same species as the
+    lesson this project already had about accuracy at a 6% positive rate, one level up."""
+    """The key-timing head scored **on its own**, at ``RebuildConfig.key_thresh``.
+
+    Not the same number as ``key_f1``, which scores the keys the DP actually chose. Both are
+    reported because they can move in opposite directions and the difference is diagnostic: a
+    head with good F1 and a pipeline with bad F1 means the bias is too low, and the reverse
+    means the bias is doing damage. Zero when the checkpoint has no key head."""
+    key_tol_min: float = 0.0
+    key_tol_max: float = 0.0
+    """The range of local tolerance the DP actually ran at, over every shape in the layer."""
     jitter_px: float = 0.0
     """Mean frame-to-frame change in the *error* of the predicted track, in crop pixels.
 
@@ -192,6 +259,18 @@ class Reconstruction:
             'key_precision': self.key_precision,
             'key_recall': self.key_recall,
             'key_f1': self.key_f1,
+            'key_f1_strict': self.key_f1_strict,
+            'shapes_with_no_in_range_key': self.shapes_with_no_in_range_key,
+            'baseline_pipeline_key_f1_random': self.baseline_pipeline_key_f1_random,
+            'key_f1_over_random': self.key_f1_over_random,
+            'head_key_precision': self.head_key_precision,
+            'head_key_recall': self.head_key_recall,
+            'head_key_f1': self.head_key_f1,
+            'baseline_key_f1_all_live': self.baseline_key_f1_all_live,
+            'baseline_key_f1_random': self.baseline_key_f1_random,
+            'head_key_f1_over_best_baseline': self.head_key_f1_over_best_baseline,
+            'key_tol_min': self.key_tol_min,
+            'key_tol_max': self.key_tol_max,
             'worst_frame': int(self.frames[int(np.argmin(self.soft_iou))]),
         }
 
@@ -213,9 +292,52 @@ def load_model(checkpoint: str | Path,
 
 
 @torch.no_grad()
+def untrained_queries(net: RotoNet, el: LayerData, seed: int = 0) -> tuple[int, int]:
+    """Give a layer the checkpoint never saw its own **freshly initialised** query rows.
+
+    Shape queries are per ``(layer, shape)``, so a layer withheld from training has no rows in
+    the query table and there is no honest default. The two available choices are not
+    equivalent:
+
+    * Reuse another layer's rows -- which is what ``shape_base.get(name, 0)`` silently does --
+      and the number measures nothing at all: a query vector trained to mean "shape 7 of FAM
+      blue" applied to a different layer's shape 7.
+    * Allocate new rows from the same initialisation the trained rows started at, which is
+      what this does. Then the number means something specific and useful: **what the encoder
+      alone produces**, with the memorisation capacity set to zero.
+
+    That second reading is the one v2 needs. ``net.RotoNet`` has said since v1 that the query
+    table is memorisation capacity, that the v1 number therefore does not transfer, and that
+    v2 must replace these embeddings with queries the encoder produces -- "and the gap between
+    the two is the honest measure of what the encoder still has to learn". This function is
+    how that gap gets measured on the *current* model instead of being deferred again.
+
+    Seeded, so the number is reproducible; and it is a floor rather than a prediction, since
+    an untrained query is worse than any query v2 would derive from the picture.
+    """
+    g = torch.Generator().manual_seed(seed)
+    out = []
+    for bank, n in ((net.shape_bank, el.n_shapes), (net.group_bank, el.n_groups)):
+        base, dim = bank.num_embeddings, bank.embedding_dim
+        grown = torch.nn.Embedding(base + n, dim)
+        # nn.Embedding initialises N(0, 1); reproduce it explicitly rather than relying on
+        # the constructor so the seed is ours and the distribution is stated.
+        with torch.no_grad():
+            grown.weight.normal_(generator=g)
+            grown.weight[:base] = bank.weight
+        grown = grown.to(bank.weight.device)
+        if bank is net.shape_bank:
+            net.shape_bank = grown
+        else:
+            net.group_bank = grown
+        out.append(base)
+    return out[0], out[1]
+
+
+@torch.no_grad()
 def predict(net: RotoNet, el: LayerData, shape_base: int = 0, group_base: int = 0,
-            batch: int = 8) -> tuple[np.ndarray, np.ndarray]:
-    """``(points (F,S,Pmax,Cmax,2) in crop space, affine (F,G,6))``.
+            batch: int = 8) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """``(points (F,S,Pmax,Cmax,2) in crop space, affine (F,G,dof), key prob (F,S) or None)``.
 
     ``shape_base``/``group_base`` are the layer's offsets into the query tables and must
     match training exactly; they come from the checkpoint.
@@ -228,10 +350,17 @@ def predict(net: RotoNet, el: LayerData, shape_base: int = 0, group_base: int = 
     The second return is ``(F, G, affine_dim)``, 6 wide for a v1-style document-space head and
     8 for v1.1's crop-space projective one. ``affine_doc`` reads the width to know which it is
     holding.
+
+    The third is the key-timing head's probability per (frame, shape), or ``None`` for a
+    checkpoint without one -- which is every checkpoint before v1.3, and the reason the flag
+    is read off the network rather than passed in: a caller that asked for key biasing from a
+    model that has no key head would otherwise get a silent uniform bias instead of an error.
     """
     out = np.zeros_like(el.points)
     dof = getattr(net, 'affine_dim', 6)
     aff = np.zeros(el.affine.shape[:2] + (dof,), np.float32)
+    has_key = bool(getattr(net, 'key_head', False))
+    keyp = np.zeros((len(el.frames), el.n_shapes), np.float32) if has_key else None
     P, C = el.points.shape[2], el.points.shape[3]
     dev = next(net.parameters()).device
     shape_ids = (torch.arange(el.n_shapes) + shape_base)[None].to(dev)
@@ -243,11 +372,13 @@ def predict(net: RotoNet, el: LayerData, shape_base: int = 0, group_base: int = 
         idx = np.arange(i, min(i + batch, len(el.frames)))
         a = torch.from_numpy(el.window(idx, in_frames, align)).to(dev)
         n = a.shape[0]
-        pts, af = net(a, shape_ids.expand(n, -1), group_ids.expand(n, -1),
-                      desc.expand(n, -1, -1))
+        pts, af, klog = net(a, shape_ids.expand(n, -1), group_ids.expand(n, -1),
+                            desc.expand(n, -1, -1))
         out[idx] = pts[:, :, :P, :C].cpu().numpy()
         aff[idx] = af[:, :el.n_groups].cpu().numpy()
-    return out, aff
+        if keyp is not None and klog is not None:
+            keyp[idx] = torch.sigmoid(klog[:, :el.n_shapes]).cpu().numpy()
+    return out, aff, keyp
 
 
 def predict_crop_points(net: RotoNet, el: LayerData, shape_base: int = 0,
@@ -377,8 +508,8 @@ def affine_doc(el: LayerData, pred_affine: np.ndarray) -> RotoDoc:
     return with_transforms(doc, el, transform_matrices(el, pred_affine))
 
 
-def rebuild(el: LayerData, local_pts: np.ndarray,
-            cfg: RebuildConfig | None = None) -> tuple[RotoDoc, dict[str, Any]]:
+def rebuild(el: LayerData, local_pts: np.ndarray, cfg: RebuildConfig | None = None,
+            key_prob: np.ndarray | None = None) -> tuple[RotoDoc, dict[str, Any]]:
     """Choose keys per shape and write a document carrying only those keys.
 
     The keyframe search runs on the point positions only, not on Bezier handles. Handles are
@@ -393,6 +524,12 @@ def rebuild(el: LayerData, local_pts: np.ndarray,
 
     Key scoring reads the artist's keys from a second, untouched copy of the IR, so the
     comparison is never the rebuilt document against itself.
+
+    ``key_prob`` is the key-timing head's per-(frame, shape) probability. It enters only as a
+    local reshaping of the DP's tolerance -- tighter where a key is expected (``cfg.key_bias``)
+    and looser where none is (``cfg.key_slack``); with both at zero, or no head,
+    ``keys.select`` stays on its original code path and the result is v1.2's bit for bit. The head is *also* scored on its own, at ``cfg.key_thresh``, and the two numbers
+    are reported side by side -- see ``Reconstruction.head_key_f1``.
     """
     cfg = cfg or RebuildConfig()
     doc = from_json_ir(json.loads((el.directory / 'target_ir.json').read_text()))
@@ -403,6 +540,14 @@ def rebuild(el: LayerData, local_pts: np.ndarray,
 
     n_pred = n_true = 0
     precs, recs, f1s, weights = [], [], [], []
+    hprecs, hrecs, hf1s, allf1s, randf1s = [], [], [], [], []
+    rand_f1s: list[float] = []
+    strict_f1s: list[float] = []
+    strict_w: list[float] = []
+    n_no_strict = 0
+    tol_lo, tol_hi = float('inf'), 0.0
+    # Seeded: the random baseline is a number a report quotes, so it has to be reproducible.
+    rng = np.random.default_rng(0)
     for si, (shape, tshape) in enumerate(zip(shapes, truth_shapes)):
         live = np.array([int(f) for f in el.frames if el.live[at[int(f)], si]], np.int32)
         P = shape.n_points
@@ -422,7 +567,15 @@ def rebuild(el: LayerData, local_pts: np.ndarray,
 
         raw = np.stack([value(f) for f in live])
         clean = smooth_track(raw, cfg.smooth, cfg.smooth_kind)
-        sel = select(clean[:, :, 0, :] * el.px_per_norm, live, cfg.tol_px)
+        # The head's probability on this shape's own live frames, in the order ``select``
+        # indexes them. Sampled rather than passed whole because the DP works per shape over
+        # its live span, and a probability aligned to the wrong axis would bias the wrong
+        # frames -- silently, and in a way only a key F1 could show.
+        kp = (key_prob[[at[int(f)] for f in live], si]
+              if key_prob is not None and (cfg.key_bias or cfg.key_slack) else None)
+        sel = select(clean[:, :, 0, :] * el.px_per_norm, live, cfg.tol_px, kp,
+                     cfg.key_bias, cfg.key_slack)
+        tol_lo, tol_hi = min(tol_lo, sel.tol_min), max(tol_hi, sel.tol_max)
         modes = [interp.get(int(f), 'linear') for f in sel.frames]
         if cfg.refit_values:
             vals = refit_key_values(raw, sel.frames, modes, live)
@@ -433,10 +586,53 @@ def rebuild(el: LayerData, local_pts: np.ndarray,
 
         truth = np.array(sorted({int(np.clip(k.frame, live[0], live[-1]))
                                  for k in tshape.path}), np.int32)
+        # The same comparison with the out-of-live-range keys *excluded* rather than clipped
+        # onto the boundary. 7.91% of this archive's 24,335 artist keys sit outside their
+        # shape's live range -- affecting half of all shapes -- and `rebuild` always forces a
+        # knot at the first and last live frame, so a clipped key is matched for free. Worth
+        # 0.009 to 0.040 key F1 per layer, which is the size of difference this project argues
+        # about. `key_f1` keeps the clipped definition, unchanged, because every number in v1,
+        # v1.1 and v1.2 used it and the plan's >= 0.42 gate was set against one of them;
+        # `key_f1_strict` is the version with the free credit removed. Both are reported.
+        strict = np.array(sorted({int(k.frame) for k in tshape.path
+                                  if live[0] <= k.frame <= live[-1]}), np.int32)
+        if len(strict):
+            sp, sr, ss = key_f1(sel.frames, strict, tolerance=1)
+            strict_f1s.append(ss); strict_w.append(len(strict))
+        else:
+            # No in-range artist key at all: there is nothing to find, so the shape is left
+            # out of the strict mean rather than scored zero for an impossible task.
+            n_no_strict += 1
         p, r, s = key_f1(sel.frames, truth, tolerance=1)
         precs.append(p); recs.append(r); f1s.append(s); weights.append(len(truth))
+        # The same trivial control the key *head* now gets, applied to the *pipeline* -- which
+        # is the number the acceptance gate reads. Key F1 with a one-frame tolerance is nearly
+        # saturated by keying often on a densely-keyed layer, and the two densest layers here
+        # carry 40% of the archive's keys. So: what would the same number of keys, placed at
+        # random over the same live frames, have scored? Anything the DP earns is the
+        # difference. Seeded, because a report quotes it.
+        pick = rng.permutation(len(live))[:len(sel.frames)]
+        rand_f1s.append(key_f1(np.sort(live[np.sort(pick)]), truth, tolerance=1)[2])
         n_pred += len(sel.frames)
         n_true += len(truth)
+        if key_prob is not None:
+            # The head alone: its own key set at its own threshold, against the same truth
+            # and the same one-frame tolerance, so the two rows are directly comparable.
+            pr = key_prob[[at[int(f)] for f in live], si]
+            own = live[pr > cfg.key_thresh]
+            hp, hr, hs = key_f1(np.asarray(own, np.int32), truth, tolerance=1)
+            hprecs.append(hp); hrecs.append(hr); hf1s.append(hs)
+            # ...and two trivial baselines on exactly the same comparison, because without
+            # them the number above is unreadable. Key density ranges 13x across these layers
+            # (0.037 to 0.474), so a head that learns nothing but each layer's *base rate*
+            # scores well: measured on the 12k probe, `Layer_52` read 0.803 against 0.797 for
+            # firing on every live frame. A head metric that can be matched by "fire on
+            # everything" is not measuring the head.
+            allf1s.append(key_f1(np.asarray(live, np.int32), truth, tolerance=1)[2])
+            n_fire = int((pr > cfg.key_thresh).sum())
+            shuffled = rng.permutation(len(live))[:n_fire]
+            rnd = np.sort(live[np.sort(shuffled)]) if n_fire else np.zeros(0, np.int32)
+            randf1s.append(key_f1(np.asarray(rnd, np.int32), truth, tolerance=1)[2])
 
     w = np.array(weights, float)
     w = w / w.sum() if w.sum() else w
@@ -445,15 +641,43 @@ def rebuild(el: LayerData, local_pts: np.ndarray,
         'key_precision': float(np.dot(w, precs)) if len(w) else 0.0,
         'key_recall': float(np.dot(w, recs)) if len(w) else 0.0,
         'key_f1': float(np.dot(w, f1s)) if len(w) else 0.0,
+        'key_tol_min': 0.0 if tol_lo == float('inf') else float(tol_lo),
+        'key_tol_max': float(tol_hi),
     }
+    if len(rand_f1s) == len(w) and len(w):
+        stats['baseline_pipeline_key_f1_random'] = float(np.dot(w, rand_f1s))
+        stats['key_f1_over_random'] = stats['key_f1'] - stats['baseline_pipeline_key_f1_random']
+    if strict_f1s:
+        sw = np.array(strict_w, float)
+        stats['key_f1_strict'] = float(np.dot(sw / sw.sum(), strict_f1s))
+        stats['shapes_with_no_in_range_key'] = int(n_no_strict)
+    if len(hf1s) == len(w) and len(w):
+        stats.update(head_key_precision=float(np.dot(w, hprecs)),
+                     head_key_recall=float(np.dot(w, hrecs)),
+                     head_key_f1=float(np.dot(w, hf1s)),
+                     # The two numbers that make the one above readable.
+                     baseline_key_f1_all_live=float(np.dot(w, allf1s)),
+                     baseline_key_f1_random=float(np.dot(w, randf1s)))
+        stats['head_key_f1_over_best_baseline'] = (
+            stats['head_key_f1'] - max(stats['baseline_key_f1_all_live'],
+                                       stats['baseline_key_f1_random']))
     return doc, stats
 
 
 def score_doc(el: LayerData, doc: RotoDoc, want: Sequence[int],
               supersample: int | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """Render ``doc`` on ``want`` and compare to the stored alpha. Returns (soft, hard)."""
+    """Render ``doc`` on ``want`` and compare to the stored alpha. Returns (soft, hard).
+
+    The render config comes from the **dataset's own record** of how its alphas were drawn,
+    not from a freshly constructed one. Through v1.2 it was the latter, which carried the
+    supersample across and quietly reasserted the class defaults for the other three
+    conventions. That could not produce a wrong number while ``datasets/v001`` agreed with
+    those defaults, and it produces a wrong one on ``v002``: the artist's own program scores
+    0.9925 on ``FAM blue_1`` instead of 1.000000, entirely because the scorer filled open
+    zero-width shapes the dataset had stroked. See ``render.raster.config_from_meta``.
+    """
     c = el.crop
-    cfg = RenderConfig(supersample=int(supersample or c.get('supersample', 2)))
+    cfg = config_from_meta(el.render or {'supersample': c.get('supersample', 2)}, supersample)
     softs, hards = [], []
     for f in want:
         x0, y0 = c['offsets'][int(f)]
@@ -468,8 +692,8 @@ def score_doc(el: LayerData, doc: RotoDoc, want: Sequence[int],
 
 
 def assemble(el: LayerData, crop_pts: np.ndarray, pred_affine: np.ndarray,
-             cfg: RebuildConfig | None = None,
-             frames: Sequence[int] | None = None) -> Reconstruction:
+             cfg: RebuildConfig | None = None, frames: Sequence[int] | None = None,
+             key_prob: np.ndarray | None = None) -> Reconstruction:
     """Predictions -> keys -> a document -> pixels -> numbers. The scoring half of
     :func:`reconstruct`, split out so it can be driven by arrays instead of a network.
 
@@ -498,7 +722,7 @@ def assemble(el: LayerData, crop_pts: np.ndarray, pred_affine: np.ndarray,
     # The keys are chosen on the local track, so which matrix is inverted here is part of
     # the de-teacher-forcing rather than a detail of it -- see the module docstring.
     mats = predicted_shape_matrices(el, pred_affine) if cfg.motion == PREDICTED else None
-    doc, kstats = rebuild(el, to_local(el, crop_pts, mats), cfg)
+    doc, kstats = rebuild(el, to_local(el, crop_pts, mats), cfg, key_prob)
     if cfg.motion == PREDICTED:
         doc = with_transforms(doc, el, transform_matrices(el, pred_affine))
     if cfg.predicted_affine:
@@ -515,5 +739,5 @@ def reconstruct(layer_dir: str | Path, net: RotoNet, cfg: RebuildConfig | None =
                 frames: Sequence[int] | None = None, shape_base: int = 0,
                 group_base: int = 0) -> Reconstruction:
     el = load_element(layer_dir)
-    crop_pts, pred_aff = predict(net, el, shape_base, group_base)
-    return assemble(el, crop_pts, pred_aff, cfg, frames)
+    crop_pts, pred_aff, key_prob = predict(net, el, shape_base, group_base)
+    return assemble(el, crop_pts, pred_aff, cfg, frames, key_prob)

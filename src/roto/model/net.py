@@ -54,6 +54,28 @@ same reason ``in_frames`` is: a model trained on neighbour alphas warped into th
 crop window must be *given* them warped at inference, and a mismatch would surface as a
 mysterious quality loss rather than an error. See ``roto.model.data.LayerData.window``.
 
+**The key-timing head is the one thing here that predicts *when* rather than *where*.**
+Everything else in this network answers "where is this control point at this frame", and the
+choice of which frames become keyframes has been made by a tolerance-driven dynamic program
+(``roto.keys``) with no learned input at all. That is not an oversight -- curve simplification
+has an exact answer and nothing to train -- but it means no component has ever been shown the
+artist's own key *timing*, and key F1 has sat at 0.36-0.41 across every configuration in
+three rounds while geometry moved from 0.92 to 0.97. v1.2 pinned the diagnosis: the
+constrained operating point raised key F1 to 0.408 from the keyframe stage alone, with no
+retraining and no new signal, while geometry sat still. So the plateau is a timing plateau.
+
+``key_head=True`` adds one scalar per (frame, shape) off the shape query -- the probability
+that *this* frame is a key for *this* shape -- supervised directly by the artist's keys. It is
+a head, not a replacement: the DP still chooses the keys, and the probability enters as a
+local bias on its tolerance (``roto.keys.dp.select``), so the head can say "key near here"
+without being able to say "key everywhere". Over-keying is this project's measured signature
+failure and a head with authority to emit keys directly would walk straight into it.
+
+The head reads the shape query *after* the cross-attention stack, so it is per (frame, shape)
+rather than per shape: the query starts as a per-(layer, shape) embedding and is then updated
+by the frame's own image tokens, which is the only thing in the forward pass that varies with
+the frame. A head on the raw embedding could only ever predict a constant.
+
 **The transform head already owns its decoder, and ``affine_depth`` is how deep.** The group
 queries run through ``gblocks`` -- their own stack of cross-attention blocks, never shared
 with the shape queries; only the encoder is shared. So "give the head its own decoder" was
@@ -160,12 +182,14 @@ class RotoNet(nn.Module):
     def __init__(self, max_shapes: int, max_groups: int, max_points: int,
                  max_coords: int, dim: int = 192, depth: int = 3,
                  in_frames: int = 1, self_attn: bool = False, affine_dim: int = 6,
-                 align_window: bool = False, affine_depth: int | None = None) -> None:
+                 align_window: bool = False, affine_depth: int | None = None,
+                 key_head: bool = False) -> None:
         super().__init__()
         self.max_points, self.max_coords = max_points, max_coords
         self.in_frames, self.self_attn = in_frames, self_attn
         self.affine_dim, self.align_window = affine_dim, align_window
         self.affine_depth = int(affine_depth or depth)
+        self.key_head = bool(key_head)
         self.encoder = AlphaEncoder(dim, in_frames)
         self.shape_bank = nn.Embedding(max_shapes, dim)
         self.group_bank = nn.Embedding(max_groups, dim)
@@ -179,6 +203,12 @@ class RotoNet(nn.Module):
             nn.Linear(dim * 2, max_points * max_coords * 2))
         self.affine_head = nn.Sequential(
             nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, affine_dim))
+        # One logit per (frame, shape). Small on purpose: the point head needs a direct
+        # projection because 93 point slots cannot be separated by two vectors, but "is this
+        # frame a key" is one number and the query already carries everything it depends on.
+        self.key_logit = nn.Sequential(
+            nn.LayerNorm(dim), nn.Linear(dim, dim // 2), nn.GELU(), nn.Linear(dim // 2, 1)
+        ) if key_head else None
         # Predictions are in crop space, where the centre of the picture is 0.5. Starting at
         # zero would put every control point in the top-left corner and spend the first
         # thousand steps translating rather than shaping.
@@ -187,11 +217,13 @@ class RotoNet(nn.Module):
 
     def forward(self, alpha: torch.Tensor, shape_ids: torch.Tensor,
                 group_ids: torch.Tensor, desc: torch.Tensor
-                ) -> tuple[torch.Tensor, torch.Tensor]:
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """``alpha`` (B,in_frames,256,256); ``shape_ids`` (B,S); ``group_ids`` (B,G); ``desc`` (B,S,3).
 
-        Returns points ``(B, S, Pmax, Cmax, 2)`` and the transform track
-        ``(B, G, affine_dim)``.
+        Returns points ``(B, S, Pmax, Cmax, 2)``, the transform track
+        ``(B, G, affine_dim)``, and the key logits ``(B, S)`` -- ``None`` unless
+        ``key_head``. The third slot is always present rather than conditionally absent so
+        that a caller which ignores it still has to say so.
         """
         tokens = self.encoder(alpha)
         q = self.shape_bank(shape_ids) + self.desc(desc)
@@ -205,4 +237,5 @@ class RotoNet(nn.Module):
         B, S, _ = q.shape
         pts = self.point_head(q).view(B, S, self.max_points, self.max_coords, 2)
         aff = self.affine_head(g)
-        return pts, aff
+        key = self.key_logit(q).squeeze(-1) if self.key_logit is not None else None
+        return pts, aff, key

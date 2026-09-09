@@ -30,15 +30,23 @@ Four terms, all in the same unit except the affine one:
   probe points*, in crop pixels. That is the same unit as the point term, so the weight stops
   being a free parameter and the term stops being separately scaled guesswork.
 
+* **key** -- the key-timing head. Binary cross-entropy on "is this frame a keyframe for this
+  shape", against the artist's own keys. The one term here that is not in pixels and cannot
+  be: it is a probability, and its weight is set by what it is worth against the pixel terms
+  rather than derived. See ``TrainConfig.key_weight`` and ``net.RotoNet``.
+
 Only *live* shapes contribute. A shape switched off at a frame has no meaningful control
 points there: the artist left them wherever they last were, and asking the network to match
-that teaches it to memorise a value nobody draws.
+that teaches it to memorise a value nobody draws. The key term is masked the same way, and
+for a sharper reason: keys are only ever *chosen* over a shape's live frames
+(``reconstruct.rebuild``), so a key predicted on a dead frame is unscoreable as well as
+unlearnable.
 """
 from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -121,6 +129,32 @@ class TrainConfig:
     and the alternative hypothesis is that it is schedule-limited like everything else here:
     at 40k the transform term is still falling (0.858 crop px and descending, ``final_long_v2``).
     Measured as one rung rather than argued."""
+    key_weight: float = 0.0
+    """Weight on the key-timing term. ``0`` leaves the head off entirely, which is v1.2.
+
+    Unlike every other term here this one is not in crop pixels and cannot be made so -- it is
+    a cross-entropy on a probability. So the weight is a real choice rather than a unit fix,
+    and it is set by what the term is worth: at 1.0 the key term is comparable in magnitude to the
+    point term at convergence (point error lands near 1 crop px, and a class-balanced BCE at
+    this archive's 9.6% positive rate lands in the same order), which is the ratio that lets
+    the head learn without the geometry giving anything up. Measured as a rung rather than argued -- see
+    ``scripts/train_v13.py``."""
+    key_balance: str = 'per_layer'
+    """Whether the key term's positive weight is one number or one per layer.
+
+    ``'per_layer'`` is the default and the fix the first probe asked for; ``'global'`` is what
+    that probe ran and is kept so the comparison stays reproducible. See
+    :func:`key_positive_rates` for what the probe measured and why one global weight is
+    exploitable: key density ranges 13x across these layers, and learning that spread scores
+    well on any metric that does not net it out."""
+    key_pos_weight: float = 0.0
+    """Positive-class weight for the key term. ``0`` means *measure it from the dataset*.
+
+    The archive keys 9.6% of live shape-frames, so an unweighted BCE is minimised at
+    "never a key" -- which scores 0.90 accuracy and F1 zero. This is the standard correction,
+    ``(1 - p) / p``, and it is measured rather than tuned because it is a property of the
+    data. Recorded on the run summary so a run can be read against the rate it was trained
+    at."""
     curve_weight: float = 0.0
     """Weight on the polyline term, relative to the point term. 0.5 was the starting point;
     the point term is kept because it is what pins down a control polygon the artist can edit,
@@ -128,7 +162,18 @@ class TrainConfig:
     temporal_weight: float = 0.0
     """Weight on the frame-to-frame consistency term."""
     holdout_every: int = 0
-    """Withhold every Nth frame from training and score it separately. 0 holds nothing."""
+    """Withhold every Nth frame from training and score it separately. 0 holds nothing.
+
+    Ignored when the dataset records its own split, which ``datasets/v002`` does and
+    ``datasets/v001`` does not -- see ``data.LayerData.split`` and ``use_split``."""
+    use_split: bool = True
+    """Obey the split the dataset recorded at build time. ``False`` trains on everything.
+
+    The default is to obey it, because a split that a run can quietly ignore is not a split.
+    The opt-out exists for exactly one row -- the one that has to be comparable to a
+    pre-split result -- and it is a *flag on the run* rather than a second dataset, so the
+    two rows differ in one recorded field and share every alpha. A run that opts out says so
+    on its own checkpoint (``split_source``), so a table can never mix the two silently."""
     sampling: str = RANDOM
     """How a step's frames are drawn: ``'random'`` (v1), ``'pairs'``, or ``'runs'``.
     See :func:`sample_indices` -- the temporal term needs ``'pairs'`` to have anything to
@@ -205,6 +250,8 @@ def _batch(el: LayerData, idx: np.ndarray, shape_base: int = 0, group_base: int 
         'probe': to(torch.from_numpy(el.probe_local)),
         'group_live': to(torch.from_numpy(el.group_live[idx])),
         'frames': to(torch.from_numpy(el.frames[idx].astype(np.int64))),
+        'key_mask': to(torch.from_numpy(el.key_mask[idx])) if el.key_mask.size
+        else to(torch.zeros((len(idx), el.n_shapes), dtype=torch.bool)),
         'shape_ids': to((torch.arange(el.n_shapes) + shape_base)[None].expand(len(idx), -1)),
         'group_ids': to((torch.arange(el.n_groups) + group_base)[None].expand(len(idx), -1)),
         'desc': to(torch.from_numpy(el.desc)[None].expand(len(idx), -1, -1)),
@@ -316,9 +363,74 @@ def affine_temporal_term(pred: torch.Tensor, target: torch.Tensor, probe: torch.
     return (d * m).sum() / n * out_px
 
 
+def key_positive_rate(els: Sequence[LayerData]) -> float:
+    """Fraction of *live* (frame, shape) cells the artist put a key on, over the dataset.
+
+    Measured rather than assumed, and reported, because it is what sets ``key_pos_weight``
+    and it is also the number that makes accuracy a useless metric for this head: at 11.3%
+    a head that never fires is right 88.7% of the time. The denominator is live cells only,
+    matching how the term is masked and how ``reconstruct.rebuild`` chooses keys.
+    """
+    keys = live = 0
+    for e in els:
+        if not e.key_mask.size:
+            continue
+        keys += int((e.key_mask & e.live).sum())
+        live += int(e.live.sum())
+    return keys / live if live else 0.0
+
+
+def key_positive_rates(els: Sequence[LayerData]) -> dict[str, float]:
+    """The same rate **per layer**, which is the number that made the first probe fail.
+
+    Measured on ``datasets/v002``, key density ranges from **0.037** on ``FAM green`` to
+    **0.474** on ``TVC Layer_52`` -- a 13x spread across layers against an archive mean of
+    0.113. With one global positive weight, the cheapest way for the head to lower its loss is
+    to learn each layer's *base rate* and fire at it, which needs no timing information at
+    all -- and a per-(layer, shape) query embedding is exactly the capacity to do that with.
+
+    That is what the 12k probe measured: on ``Layer_52`` (density 0.474) the head fired on 77%
+    of live cells and scored 0.803 matched key F1 against **0.797 for firing on everything**,
+    while on ``FAM blue`` (density 0.057) it stopped firing altogether and scored 0.017. It had
+    learned the spread and nothing inside it.
+
+    Balancing per layer removes the exploit: within a layer, positives and negatives carry
+    equal total weight, so matching the base rate gains nothing and the only remaining way
+    down is *when*.
+    """
+    out: dict[str, float] = {}
+    for e in els:
+        if not e.key_mask.size:
+            continue
+        live = int(e.live.sum())
+        out[e.layer_id] = (int((e.key_mask & e.live).sum()) / live) if live else 0.0
+    return out
+
+
+def key_term(logits: torch.Tensor, target: torch.Tensor, live: torch.Tensor,
+             pos_weight: float) -> torch.Tensor:
+    """Class-balanced BCE on "is this frame a key for this shape", over live cells only.
+
+    ``pos_weight`` multiplies the positive class, which is the whole reason this term learns
+    anything: keys are 9.6% of live cells, so plain BCE is minimised by a head that never
+    fires. Nothing here penalises firing *often* -- that job belongs downstream, where the
+    probability biases a tolerance rather than emitting a key, because over-keying is this
+    project's signature failure and a head that could emit keys directly would find it.
+    """
+    m = live
+    if not bool(m.any()):
+        return logits.new_zeros(())
+    w = logits.new_tensor(float(pos_weight))
+    loss = F.binary_cross_entropy_with_logits(
+        logits[m], target[m].to(logits.dtype), pos_weight=w, reduction='mean')
+    return loss
+
+
 def losses(pred_pts: torch.Tensor, pred_aff: torch.Tensor, b: dict[str, torch.Tensor],
            out_px: float, cfg: TrainConfig,
-           maps: PolylineMaps | None = None) -> tuple[torch.Tensor, dict[str, float]]:
+           maps: PolylineMaps | None = None,
+           pred_key: torch.Tensor | None = None,
+           key_pos_weight: float | None = None) -> tuple[torch.Tensor, dict[str, float]]:
     mask = (b['point_mask'] & b['live'][..., None, None]).unsqueeze(-1)
     n = mask.sum().clamp(min=1)
     point_px = (((pred_pts - b['points']).abs() * mask).sum() / n) * out_px
@@ -349,6 +461,20 @@ def losses(pred_pts: torch.Tensor, pred_aff: torch.Tensor, b: dict[str, torch.Te
             total = total + cfg.temporal_weight * cfg.affine_weight * at_px
             parts['affine_temporal_px'] = float(at_px.detach())
 
+    if cfg.key_weight and pred_key is not None:
+        w = cfg.key_pos_weight if key_pos_weight is None else key_pos_weight
+        key_px = key_term(pred_key, b['key_mask'], b['live'], w)
+        total = total + cfg.key_weight * key_px
+        parts['key_bce'] = float(key_px.detach())
+        with torch.no_grad():
+            hit = (pred_key > 0) & b['key_mask'] & b['live']
+            fired = (pred_key > 0) & b['live']
+            want = b['key_mask'] & b['live']
+            # Precision and recall at the 0.5 threshold, logged rather than optimised: they
+            # are what says whether a falling BCE is the head learning or the head giving up.
+            parts['key_prec'] = float(hit.sum() / fired.sum().clamp(min=1))
+            parts['key_rec'] = float(hit.sum() / want.sum().clamp(min=1))
+
     parts['total'] = float(total.detach())
     return total, parts
 
@@ -375,7 +501,19 @@ def train(dataset_root: str | Path, out_dir: str | Path,
     out.mkdir(parents=True, exist_ok=True)
     device = pick_device(cfg.device)
 
-    els = load_dataset(dataset_root, with_local=False)   # training never reads it
+    # ``trained_only`` drops whatever the dataset's own split withholds from training. On
+    # datasets/v001 that is nothing -- it has no split record -- so every earlier number
+    # reproduces; on v002 it is the two layers named in ``splits.json``. Dropping them here
+    # rather than at sampling time also drops their *query rows*, which is the point: a
+    # layer whose embedding is never allocated cannot be accidentally trained by a stray
+    # gradient, and the checkpoint records which layers existed.
+    all_els = load_dataset(dataset_root, with_local=False)   # training never reads local
+    els = [e for e in all_els if e.in_train or not cfg.use_split]
+    withheld = [e.layer_id for e in all_els if not e.in_train] if cfg.use_split else []
+    if not cfg.use_split:
+        for e in els:                       # drop the recorded frame split as well
+            e.split_train = np.zeros(0, np.int64)
+            e.split_held = np.zeros(0, np.int64)
     for e in els:
         _ = e.alphas                                   # materialise once, up front
     # Each layer owns a contiguous block of the query tables, so shape identity is per
@@ -390,19 +528,50 @@ def train(dataset_root: str | Path, out_dir: str | Path,
     max_coords = max(e.points.shape[3] for e in els)
     splits = {e.layer_id: e.split(cfg.holdout_every) for e in els}
     n_held = sum(len(h) for _, h in splits.values())
+    recorded = cfg.use_split and any(len(e.split_train) for e in els)
     affine_dim = PROJ_DOF if cfg.affine_space == CROP else AFFINE_DOF
+    # The key term's positive weight: measured from the data, never tuned. One global number
+    # is exploitable -- see key_positive_rates -- so the default balances within each layer,
+    # and both modes are kept because the first probe ran the global one.
+    key_w: dict[str, float] = {}
+    if cfg.key_weight:
+        rate = key_positive_rate(els)
+        if not cfg.key_pos_weight:
+            cfg = replace(cfg, key_pos_weight=(1.0 - rate) / rate if rate else 1.0)
+        if cfg.key_balance == 'per_layer':
+            rates = key_positive_rates(els)
+            key_w = {k: ((1.0 - v) / v if v else 1.0) for k, v in rates.items()}
+            lo, hi = min(key_w.values()), max(key_w.values())
+            print(f'key head: the artist keys {100 * rate:.1f}% of live (frame, shape) cells '
+                  f'over the archive, and {100 * min(rates.values()):.1f}%-'
+                  f'{100 * max(rates.values()):.1f}% per layer -- so the positive weight is '
+                  f'balanced per layer, {lo:.2f} to {hi:.2f} (measured, not tuned)')
+        elif cfg.key_balance == 'global':
+            print(f'key head: the artist keys {100 * rate:.1f}% of live (frame, shape) cells, '
+                  f'so key_pos_weight = {cfg.key_pos_weight:.2f} globally (measured, not '
+                  f'tuned). NOTE: one global weight is exploitable by learning each layer\'s '
+                  f'base rate -- see key_positive_rates')
+        else:
+            raise ValueError(f'unknown key_balance {cfg.key_balance!r}, '
+                             "want 'per_layer' or 'global'")
     print(f'{len(els)} layers | {sum(len(e.frames) for e in els)} frames '
-          f'({n_held} held out) | queries {max_shapes} shape / {max_groups} group  '
+          f'({n_held} held out{", from the dataset\'s own split" if recorded else ""})'
+          f'{f" | {len(withheld)} layer(s) withheld entirely" if withheld else ""} '
+          f'| queries {max_shapes} shape / {max_groups} group  '
           f'Pmax {max_points} Cmax {max_coords} | {device} | window {cfg.in_frames}'
           f'{" aligned" if cfg.align_window and cfg.in_frames > 1 else ""} '
           f'| self-attn {cfg.self_attn} | sampling {cfg.sampling} '
           f'| transform {cfg.affine_space} ({affine_dim}-dof'
-          f'{f", decoder depth {cfg.affine_depth}" if cfg.affine_depth else ""})')
+          f'{f", decoder depth {cfg.affine_depth}" if cfg.affine_depth else ""})'
+          f'{f" | key head w={cfg.key_weight}" if cfg.key_weight else ""}')
+    if withheld:
+        print('  withheld from training: ' + ', '.join(withheld))
 
     net = RotoNet(max_shapes, max_groups, max_points, max_coords, cfg.dim, cfg.depth,
                   in_frames=cfg.in_frames, self_attn=cfg.self_attn,
                   affine_dim=affine_dim, align_window=cfg.align_window,
-                  affine_depth=cfg.affine_depth or None).to(device)
+                  affine_depth=cfg.affine_depth or None,
+                  key_head=bool(cfg.key_weight)).to(device)
     n_params = sum(p.numel() for p in net.parameters())
     maps = {e.layer_id: PolylineMaps(e.n_points_per_shape, e.closed_per_shape,
                                      e.coords_per_shape, device)
@@ -430,9 +599,10 @@ def train(dataset_root: str | Path, out_dir: str | Path,
         b = _batch(el, idx, shape_base[el.layer_id], group_base[el.layer_id],
                    cfg.in_frames, device, cfg.align_window)
 
-        pts, aff = net(b['alpha'], b['shape_ids'], b['group_ids'], b['desc'])
+        pts, aff, klog = net(b['alpha'], b['shape_ids'], b['group_ids'], b['desc'])
         pts = pts[:, :, :el.points.shape[2], :el.points.shape[3]]
-        loss, parts = losses(pts, aff, b, el.out_px, cfg, maps.get(el.layer_id))
+        loss, parts = losses(pts, aff, b, el.out_px, cfg, maps.get(el.layer_id), klog,
+                             key_w.get(el.layer_id))
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -450,6 +620,9 @@ def train(dataset_root: str | Path, out_dir: str | Path,
             state.history.append(row)
             extra = ''.join(f'  {k[:-3]} {row[k]:6.3f}' for k in ('curve_px', 'temporal_px')
                             if k in row)
+            if 'key_bce' in row:
+                extra += (f'  key {row["key_bce"]:5.3f} '
+                          f'(P {row["key_prec"]:.2f} R {row["key_rec"]:.2f})')
             tr = (f'  transform {row["affine_px"]:7.3f}px' if 'affine_px' in row
                   else f'  affine {row["affine"]:.5f}')
             print(f'  step {row["step"]:>5}  point {row["point_px"]:7.3f}px'
@@ -463,9 +636,15 @@ def train(dataset_root: str | Path, out_dir: str | Path,
                  'dim': cfg.dim, 'depth': cfg.depth,
                  'in_frames': cfg.in_frames, 'self_attn': cfg.self_attn,
                  'affine_dim': affine_dim, 'align_window': cfg.align_window,
-                 'affine_depth': net.affine_depth},
+                 'affine_depth': net.affine_depth,
+                 'key_head': net.key_head},
         'config': asdict(cfg),
         'layers': [e.layer_id for e in els],
+        # What this run was *not* allowed to see, on the checkpoint rather than only in the
+        # dataset, so a scored run can be read without also having the dataset to hand.
+        'withheld_layers': withheld,
+        'dataset': str(dataset_root),
+        'split_source': 'dataset' if recorded else 'holdout_every',
         'shape_base': shape_base,
         'group_base': group_base,
         'splits': {k: {'train': v[0].tolist(), 'held': v[1].tolist()}
@@ -479,6 +658,12 @@ def train(dataset_root: str | Path, out_dir: str | Path,
     peak_mb = (torch.cuda.max_memory_allocated(device) / 2 ** 20
                if device.type == 'cuda' else None)
     summary = {'n_params': n_params, 'steps': cfg.steps, 'layers': len(els),
+               'withheld_layers': withheld, 'dataset': str(dataset_root),
+               'split_source': 'dataset' if recorded else 'holdout_every',
+               'key_positive_rate': key_positive_rate(els) if cfg.key_weight else None,
+               'key_positive_rate_per_layer': (key_positive_rates(els) if cfg.key_weight
+                                               else None),
+               'key_pos_weight_per_layer': key_w or None,
                'frames': sum(len(e.frames) for e in els), 'frames_held_out': n_held,
                'device': str(device),
                'device_name': (torch.cuda.get_device_name(device)

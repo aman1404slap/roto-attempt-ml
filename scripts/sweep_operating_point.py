@@ -82,7 +82,7 @@ def main() -> None:
     for name in LAYERS:
         d = Path(args.dataset) / name
         el = load_element(d)
-        crop_pts, _ = predict(net, el, sbase.get(name, 0), gbase.get(name, 0))
+        crop_pts, _, _ = predict(net, el, sbase.get(name, 0), gbase.get(name, 0))
         local = to_local(el, crop_pts)                     # once: independent of every axis
         frames = [int(f) for f in el.frames[::args.stride]]
         print(f'\n=== {name} ({len(el.frames)} frames, scoring {len(frames)}) ===')

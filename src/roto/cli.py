@@ -68,7 +68,10 @@ def cmd_layers(args: argparse.Namespace) -> list:
 
 
 def cmd_dataset(args: argparse.Namespace) -> list[Path]:
-    from .dataset import CropConfig, build, discover
+    import json
+    import time
+
+    from .dataset import CropConfig, build, build_splits, discover
     found = discover(args.data_root)
     if args.layer:
         wanted = set(args.layer)
@@ -80,19 +83,32 @@ def cmd_dataset(args: argparse.Namespace) -> list[Path]:
 
     cfg = CropConfig(size=args.size, supersample=args.supersample, stride=args.stride,
                      conventions=args.conventions)
-    out = []
-    for e in chosen:
+    out, built, t0 = [], [], time.time()
+    for i, e in enumerate(chosen):
         b = build(e, args.data_root, args.out_dir, cfg)
         cov = b.meta['frames']['coverage']
         c = b.meta['crop']
         off = c['frames_partly_off_source']
-        print(f'{b.layer_id}')
+        print(f'[{i + 1}/{len(chosen)}  {time.time() - t0:.0f}s] {b.layer_id}')
         print(f'  {len(b.frames)} frames  {b.n_shapes} shapes  {c["mode"]} crop '
               f'{c["size_src_px"]}px -> {args.size}x{args.size} (scale {c["scale"]:.3f})')
         print(f'  matte coverage {min(cov):.3f}..{max(cov):.3f}  '
               f'mean {sum(cov) / len(cov):.3f}'
-              + (f'  |  {off} frame(s) partly off-source' if off else ''))
+              + (f'  |  {off} frame(s) partly off-source' if off else ''), flush=True)
         out.append(b.directory)
+        built.append((b.layer_id, b.frames))
+
+    # The split is a property of the dataset, not of a run -- see dataset.splits. Written
+    # even when it holds nothing back, so every dataset carries an explicit answer to "which
+    # frames were trainable" rather than leaving it to whatever integer a run passed.
+    if built and not args.layer:
+        splits = build_splits(built, args.holdout_every, args.hold_layer, args.split_note)
+        path = Path(args.out_dir) / 'splits.json'
+        path.write_text(json.dumps(splits, indent=2))
+        print(f'\nsplit: every {args.holdout_every}th frame held '
+              f'({splits["frames_held"]} frames), '
+              f'{len(splits["held_layers"])} layer(s) held out of training '
+              f'({", ".join(splits["held_layers"]) or "none"})\n-> {path}')
     return out
 
 
@@ -128,6 +144,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="render conventions: 'v1' reproduces datasets/v001, 'measured' uses "
                         'the set refereed against the delivered EXRs (v2). Changing this '
                         're-renders every alpha, so it needs a re-baseline, not a comparison')
+    p.add_argument('--holdout-every', type=int, default=0,
+                   help='record a frame holdout of every Nth frame in splits.json; '
+                        '0 records a split that holds nothing back')
+    p.add_argument('--hold-layer', action='append', default=[], metavar='LAYER_ID',
+                   help='withhold this layer from training entirely; repeatable. Not a '
+                        'generalisation claim -- see roto.dataset.splits')
+    p.add_argument('--split-note', default='',
+                   help='why these layers were chosen, recorded alongside the split')
     p.set_defaults(fn=cmd_dataset)
 
     args = ap.parse_args(argv)

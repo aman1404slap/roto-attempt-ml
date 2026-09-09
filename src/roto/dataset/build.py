@@ -30,14 +30,18 @@ import numpy as np
 
 from ..shots import find_shot
 from .layers import layer_doc
-from ..render.raster import RenderConfig, measured_conventions, render_union
+from ..render.raster import RenderConfig, conventions, render_union
 from ..sfx.json_ir import to_json_ir
 from ..sfx.read import read_sfx
 from .arrays import derive_tensors
 from .crop import CropConfig, CropPlan, crop_plan
 from .manifest import RotoLayer, MANIFEST_VERSION, resolve
 
-DATASET_VERSION = 2
+DATASET_VERSION = 3
+"""3 is ``datasets/v002``: the measured render conventions, the clamped Catmull-Rom law, and a
+build-time split record. 2 is ``datasets/v001``, whose alphas predate the interpolation-law fix
+(``v1.2/tech.md`` S3.2) and carry two conventions refereed wrong. Bumped so a mixed read is an
+error rather than a quiet re-baseline."""
 
 
 @dataclass(slots=True)
@@ -51,12 +55,14 @@ class BuiltElement:
 
 
 def render_config_for(cfg: CropConfig) -> RenderConfig:
-    """The renderer settings one ``CropConfig`` asks for. See ``CropConfig.conventions``."""
-    if cfg.conventions == 'measured':
-        return measured_conventions(cfg.supersample)
-    if cfg.conventions == 'v1':
-        return RenderConfig(supersample=cfg.supersample)
-    raise ValueError(f'unknown conventions {cfg.conventions!r}, want v1 or measured')
+    """The renderer settings one ``CropConfig`` asks for. See ``CropConfig.conventions``.
+
+    The inverse is ``render.raster.config_from_meta``, which reads the same settings back out
+    of a built dataset's ``meta.json``. Both go through ``raster.conventions`` so that what a
+    dataset is drawn with and what a scorer renders it against cannot drift apart -- which is
+    exactly what happened for two rounds while the scorers rebuilt a default instead.
+    """
+    return conventions(cfg.conventions, cfg.supersample)
 
 
 def build(layer: RotoLayer, data_root: str | Path, out_root: str | Path,
@@ -133,7 +139,14 @@ def build(layer: RotoLayer, data_root: str | Path, out_root: str | Path,
             'stroke_px_at_0.0309': render_cfg.stroke_px(0.030864, doc.height),
             'fill_open_zero_width': render_cfg.fill_open_zero_width,
             'open_end_rule': render_cfg.open_end_rule,
+            'clip_per_shape': render_cfg.clip_per_shape,
             'union_rule': 'per-pixel max over member layers',
+            # The law the alphas are *drawn* under, recorded because getting it wrong is
+            # invisible: v001's alphas were rendered under v1's linear-ends rule and every
+            # score since was computed under the clamped one, which capped every number in
+            # the project at 0.999529 (v1.2/tech.md S3.2). A dataset that does not say which
+            # law drew it cannot be checked against the renderer that reads it.
+            'interp_law': 'clamped Catmull-Rom endpoints, one law per key (roto.ir.sample)',
         },
         'shapes': index,
         'stats': sub.stats(),

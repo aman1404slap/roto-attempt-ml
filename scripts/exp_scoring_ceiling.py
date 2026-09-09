@@ -50,7 +50,7 @@ from roto.dataset import load_alpha                                     # noqa: 
 from roto.ir import CATMULLROM, HOLD, Key, RotoDoc, sample              # noqa: E402
 from roto.metrics import soft_iou                                       # noqa: E402
 from roto.model.data import load_element                                # noqa: E402
-from roto.render.raster import RenderConfig, render_union               # noqa: E402
+from roto.render.raster import config_from_meta, render_union          # noqa: E402
 from roto.sfx.json_ir import from_json_ir                               # noqa: E402
 
 
@@ -98,7 +98,26 @@ def redrawn_under_v1_law(doc: RotoDoc, frames: Sequence[int]) -> RotoDoc:
     return doc
 
 
-def render_at(doc: RotoDoc, el, frame: int, cfg: RenderConfig) -> np.ndarray:
+ALPHA_QUANTUM = 1.0 / 65535.0
+"""One step of the 16-bit PNG the dataset stores its alphas in.
+
+The ceiling is measured against a *quantised* target, so a render that is exactly right still
+disagrees with it by up to half a step per pixel -- and a soft IoU built from those half-steps
+reads 0.999999 rather than 1.000000. Through v1.2 that gap was the reported residual and there
+was no way to tell it from a real one, because ``datasets/v001`` had a real one 400x larger
+sitting on top of it. With the real one gone the distinction is the whole measurement, so this
+script now reports both: the raw-float score (comparable to v1 / v1.1 / v1.2 row for row) and
+the score after the render is put through the *same* uint16 round trip ``dataset.build``
+applies, which is the number that can be exactly 1.0 and is required to be.
+"""
+
+
+def quantise(alpha: np.ndarray) -> np.ndarray:
+    """The uint16 round trip ``dataset.build`` writes its alphas through, exactly."""
+    return np.round(np.clip(alpha, 0, 1) * 65535).astype(np.uint16).astype(np.float32) / 65535.0
+
+
+def render_at(doc: RotoDoc, el, frame: int, cfg) -> np.ndarray:
     c = el.crop
     x0, y0 = c['offsets'][int(frame)]
     box = (x0, y0, c['out_px'] / c['scale'], c['out_px'] / c['scale'])
@@ -118,20 +137,31 @@ def main() -> None:
     rows = []
     for d in sorted(p for p in Path(args.dataset).iterdir() if (p / 'meta.json').exists()):
         el = load_element(d)
-        cfg = RenderConfig(supersample=el.crop['supersample'])
+        # The conventions this dataset's alphas were drawn with, read back from its own
+        # meta.json rather than rebuilt from a default. On v002 the difference is the
+        # whole of the residual: with the defaults, FAM blue_1 reads 0.9925 and
+        # green_2 0.9887 because the scorer fills open zero-width shapes the dataset
+        # stroked. See render.raster.config_from_meta.
+        cfg = config_from_meta(el.render)
         artist = from_json_ir(json.loads((d / 'target_ir.json').read_text()))
         frames = [int(f) for f in el.frames[::args.stride]]
-        soft = []
+        soft, softq, worst_px = [], [], 0.0
         for f in frames:
             truth = load_alpha(d, f)
             pred = render_at(artist, el, f, cfg)[:truth.shape[0], :truth.shape[1]]
             soft.append(soft_iou(pred, truth))
-        soft = np.asarray(soft)
+            softq.append(soft_iou(quantise(pred), truth))
+            worst_px = max(worst_px, float(np.abs(pred - truth).max()))
+        soft, softq = np.asarray(soft), np.asarray(softq)
         worst_i = int(np.argmin(soft))
         row = {'layer_id': el.layer_id, 'frames': len(frames),
                'mean_ceiling': float(soft.mean()), 'min_ceiling': float(soft.min()),
+               'mean_ceiling_quantised': float(softq.mean()),
+               'min_ceiling_quantised': float(softq.min()),
+               'max_abs_pixel': worst_px,
                'worst_frame': frames[worst_i],
                'frames_below_0.999': int((soft < 0.999).sum()),
+               'frames_below_1_quantised': int((softq < 1.0).sum()),
                'ceiling_per_frame': [round(float(x), 6) for x in soft],
                'frame_index': frames}
         if args.attribute:
@@ -146,30 +176,42 @@ def main() -> None:
                  if 'worst_frame_under_v1_law' in row else '')
         print(f'{el.layer_id[:46]:<48} ceiling mean {row["mean_ceiling"]:.6f}  '
               f'worst {row["min_ceiling"]:.6f} @{row["worst_frame"]}  '
-              f'<0.999 {row["frames_below_0.999"]:>3}/{row["frames"]:<3}{extra}', flush=True)
+              f'quantised worst {row["min_ceiling_quantised"]:.9f}  '
+              f'max px {row["max_abs_pixel"]:.2e}{extra}', flush=True)
 
     w = np.array([r['frames'] for r in rows], float)
     worst = min(rows, key=lambda r: r['min_ceiling'])
     totals = {
         'stride': args.stride, 'layers': len(rows), 'frames': int(w.sum()),
+        'dataset': args.dataset,
         'mean_ceiling': float(np.average([r['mean_ceiling'] for r in rows], weights=w)),
         'worst_layer_ceiling': min(r['mean_ceiling'] for r in rows),
         'worst_frame_ceiling': worst['min_ceiling'],
         'worst_frame': worst['worst_frame'], 'worst_frame_layer': worst['layer_id'],
         'frames_below_0.999': int(sum(r['frames_below_0.999'] for r in rows)),
-        'cause': 'ir.sample Catmull-Rom endpoint law changed (v1 review S6) after '
-                 'datasets/v001 was rendered; 52% of this archive\'s keys are catmullrom',
-        'fix': 'rebuild the dataset -- the same rebuild the handover already schedules for '
-               'the measured render conventions -- then re-baseline once',
+        # The exact half of the measurement: through the dataset's own uint16 round trip,
+        # which is the only comparison that can be 1.0 rather than 0.999999.
+        'mean_ceiling_quantised': float(np.average(
+            [r['mean_ceiling_quantised'] for r in rows], weights=w)),
+        'worst_frame_ceiling_quantised': min(r['min_ceiling_quantised'] for r in rows),
+        'frames_below_1_quantised': int(sum(r['frames_below_1_quantised'] for r in rows)),
+        'max_abs_pixel': max(r['max_abs_pixel'] for r in rows),
+        'half_quantum': ALPHA_QUANTUM / 2,
         'per_layer': rows,
     }
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(totals, indent=2))
-    print(f'\nceiling: mean {totals["mean_ceiling"]:.6f}, worst layer '
-          f'{totals["worst_layer_ceiling"]:.6f}, worst frame '
-          f'{totals["worst_frame_ceiling"]:.6f} ({totals["worst_frame_layer"][:30]} '
+    print(f'\nceiling: mean {totals["mean_ceiling"]:.9f}, worst layer '
+          f'{totals["worst_layer_ceiling"]:.9f}, worst frame '
+          f'{totals["worst_frame_ceiling"]:.9f} ({totals["worst_frame_layer"][:30]} '
           f'@{totals["worst_frame"]}), {totals["frames_below_0.999"]}/{totals["frames"]} '
-          f'frames below 0.999\n-> {out}')
+          f'frames below 0.999')
+    print(f'through the dataset\'s own uint16 round trip: mean '
+          f'{totals["mean_ceiling_quantised"]:.9f}, worst frame '
+          f'{totals["worst_frame_ceiling_quantised"]:.9f}, '
+          f'{totals["frames_below_1_quantised"]}/{totals["frames"]} frames below 1.0; '
+          f'worst pixel {totals["max_abs_pixel"]:.3e} against a half-quantum of '
+          f'{totals["half_quantum"]:.3e}\n-> {out}')
 
 
 if __name__ == '__main__':

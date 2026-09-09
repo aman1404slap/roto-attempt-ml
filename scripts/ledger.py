@@ -46,8 +46,13 @@ from roto.model.report import spread                                     # noqa:
 from roto.model.train import apply_proj                                  # noqa: E402
 from roto.program import decode, load_program, proj_from_matrix          # noqa: E402
 from roto.render.curves import eval_bspline                              # noqa: E402
-from roto.render.raster import RenderConfig, render_union                # noqa: E402
+from roto.render.raster import (CONVENTION_SETS, RenderConfig,           # noqa: E402
+                                config_from_meta, conventions, render_union)
 from roto.sfx.json_ir import from_json_ir                                # noqa: E402
+from roto.sfx.read import read_sfx                                       # noqa: E402
+from roto.sfx.write import write_sfx                                     # noqa: E402
+from roto.shots import find_shots                                        # noqa: E402
+from roto.dataset import frame_split, load_splits                        # noqa: E402
 
 EXACT, MEASURED, OPEN, RED = 'exact', 'measured', 'open', 'RED'
 
@@ -86,7 +91,7 @@ def ir_round_trip(dirs, stride=23):
         spec, tensors, meta = load_program(d)
         doc = decode(d, spec, tensors)
         artist = from_json_ir(json.loads((d / 'target_ir.json').read_text()))
-        cfg = RenderConfig(supersample=meta['render']['supersample'])
+        cfg = config_from_meta(meta['render'])
         size, scale = meta['crop']['size_src_px'], meta['crop']['scale']
         for f in meta['frames']['index'][::stride]:
             x0, y0 = meta['crop']['offsets'][str(f)]
@@ -144,17 +149,48 @@ def polyline_vs_renderer(els, seed=0):
 
 # ---- 2. scoring ------------------------------------------------------------
 
-def scorer_supersample(els):
-    """The scorer must render at the supersample the target was written at."""
-    bad = [el.layer_id for el in els
-           if RenderConfig(supersample=el.crop['supersample']).supersample
-           != el.crop['supersample']]
-    got = sorted({int(el.crop['supersample']) for el in els})
-    return row('scorer supersample = dataset supersample',
-               'equal on every layer, read from meta.json',
-               f'dataset {got}, scorer {got}' if not bad else f'MISMATCH on {bad}',
-               EXACT if not bad else RED, 'test_dataset.py',
-               'v1 rendered predictions at 2 against targets at 4')
+def scorer_conventions(dirs):
+    """The scorer must render with **every** convention the dataset was drawn with.
+
+    This row was "scorer supersample = dataset supersample" through v1.2, and the narrowness
+    is why it stayed green through the bug it was there to catch. The scorer carried the
+    supersample across from ``meta.json`` and rebuilt the other three conventions from
+    ``RenderConfig``'s class defaults -- which are v1's, so on ``datasets/v001`` the omission
+    could not produce a wrong number. On ``v002`` it does: the artist's own program reads
+    0.9925 on ``FAM blue_1`` and 0.9887 on ``green_2``, the two layers with hundreds of open
+    strokes, purely because the scorer filled open zero-width shapes the dataset had stroked.
+
+    So the row now compares the *whole* config, field by field, against what
+    ``render.raster.config_from_meta`` reconstructs from the record -- and it also checks that
+    the record is self-consistent with a named convention set, which is what makes a dataset
+    whose meta.json disagrees with the code an error instead of a silent re-baseline.
+    """
+    fields = ('supersample', 'samples_per_seg', 'fill_open_zero_width', 'open_end_rule',
+              'clip_per_shape')
+    bad, seen = [], set()
+    for d in dirs:
+        meta = json.loads((d / 'meta.json').read_text())
+        rec = meta['render']
+        seen.add(rec.get('conventions', 'v1'))
+        try:
+            cfg = config_from_meta(rec)                     # raises on a disagreeing record
+        except ValueError as exc:
+            bad.append(f'{d.name}: {exc}')
+            continue
+        want = conventions(rec.get('conventions', 'v1'), int(rec['supersample']))
+        for f in fields:
+            if getattr(cfg, f) != getattr(want, f):
+                bad.append(f'{d.name}.{f}')
+        h = meta['source']['height']
+        if abs(cfg.stroke_px(0.030864, h) - rec['stroke_px_at_0.0309']) > 1e-9:
+            bad.append(f'{d.name}.stroke_px')
+    return row('scorer conventions = dataset conventions',
+               f'all of {", ".join(fields)} + stroke gain, on every layer',
+               f'{len(dirs)} layers, conventions={sorted(seen)}, {len(fields) + 1} fields each'
+               if not bad else f'MISMATCH: {bad[:3]}',
+               EXACT if not bad else RED, 'test_v13.py',
+               'was supersample only through v1.2, which is how it stayed green through the '
+               'bug it exists to catch')
 
 
 def metrics_euclidean(el):
@@ -318,7 +354,7 @@ def transform_carriers(dirs):
                'v1/v1.1 skipped the fallback shapes, which flattered the head')
 
 
-def scoring_ceiling(path=Path('v1.2/results/scoring_ceiling.json')):
+def scoring_ceiling(path=Path('v1.3/results/scoring_ceiling.json')):
     """What the *artist's own program* scores against the stored alphas.
 
     The strongest form of every check in this file, and the one that is red. v1's review asked
@@ -332,37 +368,222 @@ def scoring_ceiling(path=Path('v1.2/results/scoring_ceiling.json')):
                    'not measured -- run scripts/exp_scoring_ceiling.py', RED,
                    'test_dataset.py')
     d = json.loads(path.read_text())
+    # Exact, not "1.000000 to six places". The stored alpha is uint16, so a *perfect* render
+    # still differs from it by up to half a quantum per pixel and a soft IoU built from those
+    # half-steps reads 0.999999. Through v1.2 that floor was indistinguishable from a real
+    # residual because datasets/v001 had a real one 400x larger sitting on top of it. So the
+    # requirement is stated on the comparison that can be exactly 1.0: put the render through
+    # the same uint16 round trip dataset.build writes, and check the raw-float disagreement
+    # never exceeds half a quantum, which is the only thing quantisation can cost.
+    q, worst_px = d.get('worst_frame_ceiling_quantised'), d.get('max_abs_pixel')
+    if q is None:
+        return row('artist program renders back to the stored alpha',
+                   'soft IoU 1.000000 through the dataset\'s own uint16 round trip',
+                   'measured without the quantised column -- re-run '
+                   'scripts/exp_scoring_ceiling.py', RED, 'test_v13.py')
+    half = d.get('half_quantum', 1.0 / 131070)
+    status = EXACT if (q >= 1.0 and worst_px <= half * 1.0001) else RED
     return row('artist program renders back to the stored alpha',
-               'soft IoU 1.000000 on every frame',
-               f'mean {d["mean_ceiling"]:.6f}, worst frame {d["worst_frame_ceiling"]:.6f} '
-               f'({d["worst_frame_layer"][:26]} @{d["worst_frame"]}), '
-               f'{d["frames_below_0.999"]}/{d["frames"]} frames below 0.999',
-               RED, 'test_ir.py + exp_scoring_ceiling.py',
-               'v1.1\'s Catmull-Rom endpoint fix landed after the alphas were rendered; '
-               'the v1-era renderer reproduces them to 0.999999. Closed by the rebuild')
+               'soft IoU exactly 1.0 on every frame through the uint16 round trip, and no '
+               'pixel off by more than half a quantum',
+               f'quantised mean {d["mean_ceiling_quantised"]:.9f}, worst frame {q:.9f}, '
+               f'{d["frames_below_1_quantised"]}/{d["frames"]} frames below 1.0; worst pixel '
+               f'{worst_px:.3e} vs half-quantum {half:.3e} '
+               f'(raw float: mean {d["mean_ceiling"]:.9f}, worst {d["worst_frame_ceiling"]:.9f})',
+               status, 'test_v13.py + exp_scoring_ceiling.py',
+               'RED on datasets/v001 at raw-float mean 0.999529 / worst frame 0.992632 / 247 '
+               'frames below 0.999. Two debts, found one round apart: v1.1\'s Catmull-Rom '
+               'endpoint fix landed after those alphas were rendered, and every scorer rebuilt '
+               'three of the four render conventions from class defaults. Closed by the v002 '
+               'rebuild and by config_from_meta respectively')
 
 
-def render_conventions(path=Path('v1.1/results/render_conventions.json')):
-    """The one row that is not ours to close. Left open, with the measurement on the table."""
-    note = ('self-consistent against our own render; the flip belongs to the dataset rebuild, '
-            'and the zero-margin claim needs one written .sfx diffed in Silhouette')
-    if not path.exists():
-        return row('render conventions vs Silhouette', 'match Silhouette\'s own EXRs',
-                   'not measured here', OPEN, 'test_v11.py', note)
-    d = json.loads(path.read_text())
-    keys = [k for k in ('conventions', 'summary', 'findings') if k in d]
-    return row('render conventions vs Silhouette',
-               'match Silhouette\'s own EXRs (two are measured wrong)',
-               f'refereed in v1.1: {", ".join(keys) or "see file"}; '
-               '2 of 4 conventions wrong in datasets/v001', OPEN, 'test_v11.py', note)
+def render_conventions(dirs, path=Path('v1.1/results/render_conventions.json')):
+    """Which convention set the dataset in hand is drawn with, against the refereed one.
+
+    v1.1 refereed four conventions against Silhouette's delivered EXRs and found three of
+    them against what the code shipped; v1.1 and v1.2 both left them in place on purpose,
+    because changing any of them re-renders the training alphas and their whole value was
+    being comparable to v1 row for row. **That argument expired at this rebuild**, and the
+    row is what says whether the flip actually landed rather than being intended.
+
+    It goes green only when every layer is drawn with the ``measured`` set. It does *not*
+    claim agreement with Silhouette to a tolerance -- the referee was against delivered EXRs
+    at one frame per layer, and the zero-margin claim still needs a written ``.sfx`` opened in
+    a seat, which is its own row and not ours to close.
+    """
+    sets = {}
+    for d in dirs:
+        rec = json.loads((d / 'meta.json').read_text())['render']
+        sets.setdefault(rec.get('conventions', 'v1'), []).append(d.name)
+    got = ', '.join(f'{k} x{len(v)}' for k, v in sorted(sets.items()))
+    measured_only = set(sets) == {'measured'}
+    return row('render conventions = the set refereed against Silhouette',
+               "every layer drawn with v1.1's measured set (fill_open_zero_width=False, "
+               'stroke at the 1 px floor, duplicate open ends)',
+               got, EXACT if measured_only else RED,
+               'test_v11.py + test_v13.py',
+               'v1.1 measured 3 of 4 against what shipped and left them; datasets/v001 '
+               'carries the wrong two. The referee is against delivered EXRs, so this row '
+               'is about the flip landing, not about zero margin in Silhouette'
+               + (f'; v1.1 evidence in {path}' if path.exists() else ''))
 
 
-def noise_floor(results=Path('v1.2/results'), runs=('v1_control', 'control_s1', 'control_s2'),
-                long_runs=('v1_control_long', 'control_long_s1', 'control_long_s2')):
+def sfx_round_trip(data_root='data/extracted/test_data'):
+    """``read(write(IR))`` must return the same IR, bit for bit, on every archive shot.
+
+    The row the deliverable loop rests on. ``sfx/write.py`` was a ``NotImplementedError``
+    seam through v1.2 for a stated reason -- a writer nobody has opened in Silhouette is
+    unverifiable -- and that reason had a second half that has now gone: while the program's
+    transform track carried six numbers where the archive needs eight, a file written from it
+    would have put one layer 350 crop px from where the artist left it. With the projective
+    fix in, the only thing left to wait for is the seat, and a file cannot be checked in a
+    seat until it exists.
+
+    Bit-exact rather than exact-to-a-tolerance, which is a choice in the writer: numbers go
+    out at shortest-round-trip precision (``repr``) instead of Silhouette's fixed 9 decimals,
+    so a float that goes in comes back with the same bits. Every dialect and both containers
+    are walked, because the container is the half of the format most likely to be got wrong
+    silently -- a zlib stream that decompresses to *almost* the right bytes still parses.
+    """
+    import glob
+
+    def diff(a, b, path=''):
+        """First disagreement between two IR trees, as a string, or ''."""
+        if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+            x, y = np.asarray(a, np.float64), np.asarray(b, np.float64)
+            if x.shape != y.shape:
+                return f'{path}: shape {x.shape} != {y.shape}'
+            d = float(np.abs(x - y).max()) if x.size else 0.0
+            return f'{path}: values differ by {d:.3e}' if d else ''
+        if isinstance(a, (list, tuple)):
+            if len(a) != len(b):
+                return f'{path}: {len(a)} != {len(b)} items'
+            for i, (x, y) in enumerate(zip(a, b)):
+                if (m := diff(x, y, f'{path}[{i}]')):
+                    return m
+            return ''
+        if isinstance(a, dict):
+            if sorted(a) != sorted(b):
+                return f'{path}: keys {sorted(a)} != {sorted(b)}'
+            for k in a:
+                if (m := diff(a[k], b[k], f'{path}.{k}')):
+                    return m
+            return ''
+        if hasattr(a, '__slots__'):
+            for f in a.__slots__:
+                if (m := diff(getattr(a, f), getattr(b, f), f'{path}.{f}')):
+                    return m
+            return ''
+        return '' if a == b else f'{path}: {a!r} != {b!r}'
+
+    import tempfile
+    tmp = Path(tempfile.mkdtemp())
+    shots, bad, dialects = 0, [], set()
+    for shot in find_shots(data_root):
+        if shot.sfx is None:
+            continue
+        doc = read_sfx(shot.sfx)
+        back = read_sfx(write_sfx(doc, tmp / f'{shot.name}.sfx'))
+        dialects.add(doc.dialect)
+        shots += 1
+        for f in ('width', 'height', 'duration', 'frame_rate', 'start_frame', 'dialect',
+                  'source_path', 'source_label'):
+            if getattr(doc, f) != getattr(back, f):
+                bad.append(f'{shot.name}.{f}')
+        if (m := diff(doc.roots, back.roots, shot.name)):
+            bad.append(m)
+    return row('read(write(IR)) is bit-exact',
+               'every field of every shape, layer and track identical, all dialects',
+               f'{shots} shots, {len(dialects)} dialects '
+               f'({", ".join(sorted(dialects))}), 0 differences'
+               if not bad else f'DIFFERS: {bad[:2]}',
+               EXACT if not bad else RED, 'test_v13.py',
+               'raised NotImplementedError through v1.2; opening one in Silhouette is a '
+               'separate row and needs a seat')
+
+
+def split_record(dirs, dataset):
+    """The split must be the *dataset's*, recorded once, and agree with the rule.
+
+    Two things, and the second is the one that bites. First: ``splits.json`` must reproduce
+    the frame rule ``LayerData.split`` used through v1.2, or a v002 held-frame gap is not
+    comparable to v1.1's +0.0005. Second: a layer the record withholds from training must
+    actually be absent from training, which is a property of the *run* and so is checked
+    against the checkpoints in :func:`training_respected_split` once any exist.
+
+    A dataset with no record is not red -- ``datasets/v001`` has none by construction, and
+    every published v1/v1.1/v1.2 number was measured without one. It is ``open``.
+    """
+    rec = load_splits(dataset)
+    if rec is None:
+        return row('split is defined at build time', 'the dataset records its own split',
+                   f'{Path(dataset).name} has no splits.json', OPEN,
+                   'test_v13.py', 'datasets/v001 predates the record; the rule is '
+                                  'recomputed per run there')
+    bad = []
+    for d in dirs:
+        meta = json.loads((d / 'meta.json').read_text())
+        lid, frames = meta['layer']['layer_id'], meta['frames']['index']
+        got = rec['layers'].get(lid)
+        if got is None:
+            bad.append(f'{lid}: not in splits.json')
+            continue
+        tr, he = frame_split(len(frames), rec['holdout_every'])
+        if [frames[i] for i in tr] != got['frames_train'] or \
+                [frames[i] for i in he] != got['frames_held']:
+            bad.append(f'{lid}: recorded split disagrees with frame_split()')
+    held = rec['held_layers']
+    return row('split is defined at build time',
+               'splits.json reproduces frame_split() on every layer; held layers named',
+               f'every {rec["holdout_every"]}th frame ({rec["frames_held"]} frames), '
+               f'{len(held)} layer(s) held out, {len(rec["trained_layers"])} trainable'
+               if not bad else f'MISMATCH: {bad[:2]}',
+               EXACT if not bad else RED, 'test_v13.py',
+               'held layers: ' + (', '.join(h[:30] for h in held) or 'none'))
+
+
+def key_target(dirs):
+    """The key-timing head's target must be exactly the artist's keys, on the rendered axis.
+
+    A new head needs a new Bucket-A row, and this one is cheap to get wrong in a way no
+    aggregate would show: ``LayerData.key_mask`` is built by indexing the artist's key frames
+    into the rendered frame axis, and a shape whose keys sit outside that axis (the archive
+    has keys at frame -1) must be *dropped* rather than clamped to frame 0 -- clamping would
+    invent a key the artist never set, on the frame a shape is most often keyed on anyway,
+    and inflate key recall for free.
+    """
+    total = dropped = 0
+    bad = []
+    for d in dirs:
+        el = load_element(d, with_local=False)
+        t = np.load(d / 'tensors.npz')
+        frames = set(int(f) for f in el.frames)
+        for i in range(el.n_shapes):
+            kf = [int(k) for k in t[f'key_frames/{i}'].tolist()]
+            total += len(kf)
+            inside = sorted(k for k in kf if k in frames)
+            dropped += len(kf) - len(inside)
+            got = sorted(int(el.frames[j]) for j in np.where(el.key_mask[:, i])[0])
+            if got != inside:
+                bad.append(f'{d.name}#{i}')
+    return row('key-timing target = the artist\'s own keys',
+               'key_mask holds exactly the artist keys that fall on a rendered frame',
+               f'{total - dropped}/{total} artist keys on the rendered axis, '
+               f'{dropped} outside it and dropped rather than clamped'
+               if not bad else f'MISMATCH on {bad[:3]}',
+               EXACT if not bad else RED, 'test_v13.py',
+               'clamping an out-of-range key to frame 0 would invent a key and inflate recall')
+
+
+def noise_floor(results=Path('v1.3/results'),
+                runs=('v002_control', 'v002_control_s1'),
+                long_runs=('v002_final', 'v002_final_s1')):
     """The last row, and the one that makes every other table readable: what a metric does
     when nothing changes but the seed."""
     out = []
-    for label, group, steps in (('12k', runs, 12000), ('40k', long_runs, 40000)):
+    for label, group, steps in (('control, 40k', runs, 40000),
+                                ('headline, 40k', long_runs, 40000)):
         got = []
         for r in group:
             p = results / f'score_{r}.json'
@@ -388,10 +609,12 @@ def noise_floor(results=Path('v1.2/results'), runs=('v1_control', 'control_s1', 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--dataset', default='datasets/v001')
-    ap.add_argument('--out', default='v1.2/results')
-    ap.add_argument('--results', default='v1.2/results',
+    ap.add_argument('--dataset', default='datasets/v002')
+    ap.add_argument('--out', default='v1.3/results')
+    ap.add_argument('--results', default='v1.3/results',
                     help='where the scored runs live, for the noise-floor row')
+    ap.add_argument('--data-root', default='data/extracted/test_data',
+                    help='the archive, for the .sfx round-trip row')
     args = ap.parse_args()
 
     t0 = time.time()
@@ -404,15 +627,18 @@ def main() -> None:
         ir_round_trip(hard_dirs),
         crop_round_trip(els),
         polyline_vs_renderer(els),
-        scorer_supersample(els),
+        scorer_conventions(all_dirs),
         cr_endpoints(all_dirs),
         metrics_euclidean(small),
         key_f1_order_free(),
         window_alignment(els[:2]),
         *probe_transform(els[:2]),
         transform_carriers(all_dirs),
-        scoring_ceiling(),
-        render_conventions(),
+        scoring_ceiling(Path(args.out) / 'scoring_ceiling.json'),
+        render_conventions(all_dirs),
+        sfx_round_trip(args.data_root),
+        split_record(all_dirs, args.dataset),
+        key_target(all_dirs),
         *noise_floor(Path(args.results)),
     ]
 

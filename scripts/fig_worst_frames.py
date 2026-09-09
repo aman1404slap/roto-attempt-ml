@@ -31,19 +31,22 @@ from roto.model.smoothing import BOXCAR, KINDS                          # noqa: 
 from roto.sfx.json_ir import from_json_ir                               # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from report_v12 import coverage_of, find_run                            # noqa: E402
+from report_v13 import coverage_of, find_run                            # noqa: E402
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--run', default='final_long_v2')
+    ap.add_argument('--run', default='v002_final')
+    ap.add_argument('--results', default='v1.3/results',
+                    help='where score_<run>.json and scoring_ceiling.json live')
     ap.add_argument('--score', default=None,
                     help='score json to read the per-frame numbers from '
-                         '(default: v1.2/results/score_<run>.json)')
-    ap.add_argument('--dataset', default='datasets/v001')
-    ap.add_argument('--ceiling', default='v1.2/results/scoring_ceiling.json')
-    ap.add_argument('--out', default='v1.2/figures/worst_frames.png')
+                         '(default: <results>/score_<run>.json)')
+    ap.add_argument('--dataset', default=None,
+                    help="default: the dataset the score json records")
+    ap.add_argument('--ceiling', default=None)
+    ap.add_argument('--out', default='v1.3/figures/worst_frames.png')
     ap.add_argument('--layers', type=int, default=2, help='how many worst layers to draw')
     # The rebuild settings must match the ones the score json was produced with, or the
     # figure shows a different reconstruction than the numbers it is captioned with.
@@ -54,7 +57,7 @@ def main() -> None:
     ap.add_argument('--motion', default=ARTIST, choices=list(MOTION_SOURCES))
     args = ap.parse_args()
 
-    score = Path(args.score or f'v1.2/results/score_{args.run}.json')
+    score = Path(args.score or f'{args.results}/score_{args.run}.json')
     if not score.exists():
         raise SystemExit(f'{score} not found -- score the run first')
     d = json.loads(score.read_text())
@@ -66,19 +69,24 @@ def main() -> None:
         if hasattr(cfg, k) and k not in kw and v is not None:
             setattr(cfg, k, v)
 
+    dataset = args.dataset or d.get('dataset') or 'datasets/v002'
+    ceiling = Path(args.ceiling or f'{args.results}/scoring_ceiling.json')
     ceil = {}
-    if Path(args.ceiling).exists():
-        ceil = {r['layer_id']: r for r in json.loads(Path(args.ceiling).read_text())
-                ['per_layer']}
+    if ceiling.exists():
+        ceil = {r['layer_id']: r for r in json.loads(ceiling.read_text())['per_layer']}
 
     net, ck = load_model(find_run(args.run))
     sbase, gbase = ck.get('shape_base', {}), ck.get('group_base', {})
-    worst = sorted(d['per_layer'], key=lambda r: r['mean_soft_iou'])[:args.layers]
+    # Only layers the run trained on. A withheld layer has freshly initialised query rows and
+    # is always the worst by a mile, so an unfiltered pick would make this figure a picture of
+    # the query table rather than of the frames that would get a shot sent back.
+    candidates = [r for r in d['per_layer'] if r.get('in_train', True)]
+    worst = sorted(candidates, key=lambda r: r['mean_soft_iou'])[:args.layers]
 
     rows = []
     for lay in worst:
         name = lay['layer_id']
-        p = Path(args.dataset) / name
+        p = Path(dataset) / name
         el = load_element(p)
         soft = np.asarray(lay['soft_iou_per_frame'], float)
         frames = np.asarray(lay['frame_index'], int)

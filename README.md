@@ -29,7 +29,9 @@ partition, which is why a matte cannot simply be split back into its shapes.
 
 ## Status
 
-v1 is complete: **13 layers across 4 shots reconstruct at 0.9218 soft IoU.** See
+Current best, on the rebuilt dataset and the 11 layers a run trains on: **0.9749 soft IoU at
+0.80× the artist's keyframe count**, or **0.9703 with the artist's motion track taken away
+entirely**. v1 is complete: **13 layers across 4 shots reconstruct at 0.9218 soft IoU.** See
 [v1/OVERVIEW.md](v1/OVERVIEW.md) for what that means and [v1/tech.md](v1/tech.md) for how.
 `v1/` is frozen; its published numbers are reproducible at commit `2d1d53e`.
 
@@ -63,8 +65,40 @@ perfect — the strongest habit to carry forward. Because metric fixes landed, t
 checkpoint no longer scores what v1 published, so v1.1 compares against a re-baselined row
 rather than 0.9218.
 
-Both are an **overfit** — trained and measured on the same 13 layers. They answer "can we
-regenerate roto we have been shown", not "can we roto an unseen shot". That is v2.
+v1.3 answers the handover written after v1.2 ([v1.2-to-v1.3-plan.md](v1.2-to-v1.3-plan.md)),
+whose reading was that "the model and method are no longer the bottleneck — the *ground* they
+stand on is". It rebuilds that ground once as `datasets/v002`, re-baselines every past number
+against it, writes real Silhouette projects for the first time, and defines done as eleven
+acceptance gates a script reads mechanically.
+
+The reading was right, and by more than expected. **Re-rendering the targets correctly is worth
++0.0048 soft IoU — slightly more than v1.1's whole architecture ladder (+0.0039) against the
+same anchor** — and it made the dataset two to eight times quieter run to run. The exactness
+ledger's last RED row is closed *exactly*: the artist's own program now scores
+**1.000000000 on every one of 1,810 frames** through the dataset's own uint16 round trip.
+`read(write(IR))` is bit-exact on all six archive shots and four dialects, and the eleven files
+in `v1.3/sfx/` re-read to the exact documents the report scores.
+
+Two findings are worth more than the headline. The rebuild exposed a **third instance of one bug
+class** — every scorer built its own `RenderConfig` and so silently reasserted v1's conventions
+for three of four, invisible on `v001` because v001's conventions *are* the class defaults. And
+the key-timing head **would have passed its own gate while having learned nothing**: it scored
+0.803 where firing on every live frame scores 0.797, because key density ranges 13× across these
+layers. Every key metric now carries the baselines that make it readable — which showed that
+v1.2's published 0.408 key F1 is 0.322 of random placement plus 0.086 of skill.
+
+The head itself fails as a key *detector* (at trivial baseline, both seeds, both schedules) and
+works as a *bias* on the keyframe search: **key F1 0.518 against v1.2's best-ever 0.408**, at an
+editable key economy and no measurable cost in soft IoU. Six of ten measurable gates pass, and
+three of the four failures are a single 16-shape layer that √ weighting sacrifices — so the
+plan's "the failing gate names the next rung" resolves to one parameter. See
+[v1.3/OVERVIEW.md](v1.3/OVERVIEW.md), [v1.3/plan-response.md](v1.3/plan-response.md) and
+[v1.3/tech.md](v1.3/tech.md).
+
+All of them are an **overfit** — trained and measured on the same layers. v1.3 adds the plumbing
+a generalisation claim needs (a build-time split that withholds two layers, and the measurement
+that with untrained query rows the encoder alone scores 0.238) and makes none: a layer is not a
+shot. That is still v2.
 
 ## Setup
 
@@ -131,23 +165,30 @@ scripts/           eval_keys.py, report_v1.py, and the v1.1 set:
                    sweep_operating_point.py, fig_worst_layers.py,
                    exp_conventions.py, exp_peak_frames.py,
                    exp_offset_jitter.py, exp_affine_target.py
-                   ...and the v1.2 set: ledger.py (the exactness ledger),
+                   ...the v1.2 set: ledger.py (the exactness ledger),
                    train_v12.py / report_v12.py / summarise_v12.py,
                    exp_scoring_ceiling.py, exp_noise_floor.py, fig_worst_frames.py
-tests/             123 tests
+                   ...and the v1.3 set: train_v13.py / report_v13.py /
+                   summarise_v13.py / sweep_v13.py, gates.py (the acceptance
+                   gates), rebaseline_v13.py (re-anchoring across datasets),
+                   write_sfx_v13.py, queue_v13.sh / score_v13.sh /
+                   autoscore_v13.sh / track_v13.py (the run queue and its ETA)
+tests/             148 tests
 v1/                deliverables (gitignored): docs, checkpoint, results, figures
 v1.1/              same, for the review response: ladder, sweeps, referees
 v1.2/              same, for the handover: the ledger, the noise floor, worst-case tables
+v1.3/              same, for the consolidation round: the rebuilt dataset, the
+                   acceptance gates, the key-timing head, and real .sfx files
 ```
 
 ## Tests
 
 ```bash
-pytest                    # 123 tests, ~85s — they render real archive frames
+pytest                    # 148 tests, ~170s — they render real archive frames
 python scripts/ledger.py  # the exactness ledger; exits non-zero if a row is red
 ```
 
-Four carry the most weight:
+Five carry the most weight:
 
 - **`test_dataset.py`** asserts `decode(encode(program))` renders back to the layer's own
   matte, at strides 1, 7 and 20. Tolerance is `1e-4`, which is 16-bit PNG quantisation on the
@@ -163,13 +204,22 @@ Four carry the most weight:
   the renderer puts them, both to 1e-9 crop px on the real archive. It also pins the
   de-teacher-forcing path the only way that means anything: hand it the artist's own transform
   track and it must reproduce the teacher-forced reconstruction exactly.
+- **`test_v13.py`** asserts that two code paths agree on the real archive, because that is how
+  every bug this project has found actually hid. The scorer's render conventions must be the
+  dataset's own — the test fails if the class defaults stop being wrong, so it cannot rot into
+  a tautology. `read(write(IR))` must be bit-exact in both containers. And the key-timing head
+  must *vary with the frame*: a head wired to the raw query embedding would train, report a
+  falling loss, and predict a constant.
 
 ## Not in scope yet
 
-- **Writing a real `.sfx`.** [src/roto/sfx/write.py](src/roto/sfx/write.py) is a documented
-  seam that raises `NotImplementedError`. This needs no machine learning — it is serialisation
-  from the IR — but nothing we write has ever been opened in Silhouette, and checking that
-  needs a licence seat.
-- **Generalising to unseen shots.**
+- **Generalising to unseen shots.** v1.3 puts the plumbing in — `datasets/v002` withholds two
+  layers from training at build time — but a layer is not a shot, and shape queries are
+  per (layer, shape), so nothing here is a generalisation claim.
 - **Harder inputs.** The matte is rendered from the answer, so it is perfectly clean. A plate,
   or a mask from another tool, is not.
+
+Writing a real `.sfx` **is** now in scope: [src/roto/sfx/write.py](src/roto/sfx/write.py)
+emits both containers and all four dialects, and `read(write(IR))` is bit-exact on every
+archive shot. What is still open is one file **opened in Silhouette**, which needs a licence
+seat — see [v1.3/sfx/README.md](v1.3/sfx/README.md) for the fifteen-minute check.

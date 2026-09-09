@@ -25,13 +25,13 @@ the target in the space the picture depicts. See :func:`~roto.model.geometry.cro
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from ..dataset import load_alpha
+from ..dataset import load_alpha, load_splits
 from ..ir import opacity_at, sample
 from .geometry import crop_matrix, local_to_crop
 from ..program import affine_from_matrix, proj_from_matrix
@@ -103,6 +103,31 @@ class LayerData:
     probe_local: np.ndarray     # (G, K, 2) float32, per-group probe points in local coords
     group_live: np.ndarray      # (F, G) bool -- has this group any live shape at this frame
     out_px: int = 256
+    render: dict = field(default_factory=dict)
+    """The ``meta['render']`` block: the conventions these alphas were **drawn** with.
+
+    Carried on the layer rather than looked up per call site because the v002 rebuild showed
+    what happens when it is not: every scorer built its own ``RenderConfig`` from the
+    supersample alone and silently reasserted the class defaults for the other three
+    conventions, which was invisible while the dataset agreed with those defaults and wrong
+    the moment it did not. See ``render.raster.config_from_meta``."""
+    key_mask: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), bool))
+    """``(F, S)`` bool -- is this rendered frame an *artist* keyframe for this shape.
+
+    The key-timing head's target, and the one thing in this project that has never been
+    supervised. Keys outside the rendered frame range are dropped here on purpose: this array
+    is aligned to ``frames`` because it is a per-frame prediction target, and the full key
+    axis (which spans keys at frame -1 and beyond the last rendered frame) lives in
+    ``program.ProgramTensors.key_mask`` where nothing is asked to predict it."""
+    split_train: np.ndarray = field(default_factory=lambda: np.zeros((0,), np.int64))
+    split_held: np.ndarray = field(default_factory=lambda: np.zeros((0,), np.int64))
+    in_train: bool = True
+    """The dataset's own split, read from ``splits.json`` rather than recomputed per run.
+
+    ``in_train=False`` is a layer withheld from training *entirely*. It is not a
+    generalisation claim -- shape queries are per ``(layer, shape)``, so such a layer has
+    never had its query rows updated -- it is how much of the headline number lives in the
+    query table. See ``roto.dataset.splits``."""
 
     @property
     def n_shapes(self) -> int:
@@ -214,6 +239,13 @@ class LayerData:
     def split(self, holdout_every: int) -> tuple[np.ndarray, np.ndarray]:
         """``(train_idx, held_idx)`` frame positions. ``holdout_every <= 0`` holds nothing.
 
+        **A dataset that records its own split wins.** ``datasets/v002`` writes
+        ``splits.json`` at build time (``roto.dataset.splits``), and when it is present this
+        returns it verbatim and ignores ``holdout_every`` -- because the split is then a
+        property of the data, and two runs quoting a held-out gap over different frames is
+        the failure the record exists to prevent. ``datasets/v001`` has no record, so the
+        rule below still computes one and every v1/v1.1/v1.2 number reproduces.
+
         Every Nth frame is withheld from training and scored separately. v1 trained and
         measured on the same frames, which answers "can we regenerate roto we have been
         shown" but cannot distinguish a network that interpolates its memorisation from one
@@ -222,6 +254,8 @@ class LayerData:
         The held frames are never the first or last of the track, so a held frame always has
         trained neighbours on both sides and the temporal window stays well defined.
         """
+        if len(self.split_train):
+            return self.split_train, self.split_held
         n = len(self.frames)
         if holdout_every <= 1:
             return np.arange(n), np.zeros(0, np.int64)
@@ -272,6 +306,17 @@ def load_element(directory: str | Path, with_local: bool = True) -> LayerData:
     offsets = {int(k): tuple(v) for k, v in crop['offsets'].items()}
     pos = {int(f): k for k, f in enumerate(mframes)}
 
+    # The artist's own keyframes, as a per-frame mask on the rendered frame axis. This is
+    # the key-timing head's target; see LayerData.key_mask for why keys outside the rendered
+    # range are dropped rather than clamped.
+    at_frame = {int(f): i for i, f in enumerate(frames)}
+    key_mask = np.zeros((len(frames), n), bool)
+    for i in range(n):
+        for kf in t[f'key_frames/{i}'].tolist():
+            j = at_frame.get(int(kf))
+            if j is not None:
+                key_mask[j, i] = True
+
     local = np.zeros((len(frames), n, Pmax, Cmax, 2), np.float32)
     points = np.zeros((len(frames), n, Pmax, Cmax, 2), np.float32)
     matrices = np.zeros((len(frames), n, 4, 4), np.float64)
@@ -320,14 +365,37 @@ def load_element(directory: str | Path, with_local: bool = True) -> LayerData:
 
     if not with_local:
         local = np.zeros((0,), np.float32)
+    # The dataset's own split, when it has one. Read here rather than in train() so that
+    # every consumer -- training, scoring, the gate script -- sees the same one.
+    rec = (load_splits(d.parent) or {}).get('layers', {}).get(meta['layer']['layer_id'], {})
+    pos = {int(f): i for i, f in enumerate(frames)}
+    tr = np.array([pos[f] for f in rec.get('frames_train', []) if f in pos], np.int64)
+    he = np.array([pos[f] for f in rec.get('frames_held', []) if f in pos], np.int64)
     return LayerData(meta['layer']['layer_id'], d, frames, points, local, live, affine,
                        group_of, desc, pmask, float(crop['px_per_norm']), matrices,
                        {'width': source['width'], 'height': source['height'],
                         'scale': crop['scale'], 'out_px': out_px, 'offsets': offsets,
-                        'supersample': int(meta.get('render', {}).get('supersample', 2))},
-                       proj_crop, crop_mats, probes, group_live, out_px)
+                        'supersample': int(meta.get('render', {}).get('supersample', 2)),
+                        # Also in the crop bag, not only in ``render``, because the figure
+                        # path is handed this dict alone and draws outlines through the
+                        # renderer's own polyline evaluator -- which reads ``open_end_rule``.
+                        # A figure drawn under the wrong rule disagrees with the IoU printed
+                        # beside it at every open-stroke end.
+                        'render': dict(meta.get('render', {}))},
+                       proj_crop, crop_mats, probes, group_live, out_px,
+                       render=dict(meta.get('render', {})), key_mask=key_mask,
+                       split_train=tr, split_held=he,
+                       in_train=bool(rec.get('in_train', True)))
 
 
-def load_dataset(root: str | Path, with_local: bool = True) -> list[LayerData]:
-    return [load_element(p, with_local) for p in sorted(Path(root).iterdir())
-            if (p / 'meta.json').exists()]
+def load_dataset(root: str | Path, with_local: bool = True,
+                 trained_only: bool = False) -> list[LayerData]:
+    """Every layer of a built dataset, in directory order.
+
+    ``trained_only`` drops the layers the dataset's own split withholds from training. It is
+    the *training* loader's flag and never the scorer's: a held-out layer still has to be
+    scored, and reported apart from the rest, or the split measures nothing.
+    """
+    els = [load_element(p, with_local) for p in sorted(Path(root).iterdir())
+           if (p / 'meta.json').exists()]
+    return [e for e in els if e.in_train] if trained_only else els
