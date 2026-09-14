@@ -112,7 +112,7 @@ Two environments, one source of truth, one writable bucket.
             ├──────────────────────────────┐
             ▼                              ▼
   ┌─────────────────────┐        ┌─────────────────────────────┐
-  │  LOCAL (Mac)        │        │  STAGING (EC2 + GPU)        │
+  │  LOCAL (Mac)        │        │  STAGING (ECS GPU task)     │
   │  a few shots        │        │  the real runs              │
   │  "does it run?"     │        │  two seeds, full schedule   │
   │                     │        │  triggered over an API      │
@@ -181,7 +181,7 @@ drift underneath us. It is only better if a rebuild can be *proved* to match —
 ### The blockers, in order of how often they kill a cross-account setup
 
 **KMS.** If prod objects are encrypted with a customer-managed key, an S3 bucket policy alone is
-**not enough** — the instance role also needs `kms:Decrypt` granted in the **key policy in the
+**not enough** — the task role also needs `kms:Decrypt` granted in the **key policy in the
 prod account**, a separate resource often owned by a separate team. It fails as a bare
 `AccessDenied` with nothing pointing at KMS.
 
@@ -216,8 +216,8 @@ so it is debugged before it is load-bearing.
 [train.py:939](src/roto/v2/train.py#L939). A 31-minute run that dies at minute 30 loses
 everything — and at 1,000 shots the runs get much longer than 31 minutes.
 
-On-demand that is an annoyance. **On spot it is a certainty**, and spot is roughly a 70% saving.
-It is also what makes an API-triggered job safe to retry.
+It is also what makes an API-triggered job safe to retry, and what lets a task be reclaimed or
+rescheduled without losing the run.
 
 Needed: `state_dict` + optimizer + scheduler + step counter + RNG state written every N steps, and
 a `--resume` that picks up from the last one. Perhaps 40 lines, plus a test that kills a run
@@ -262,8 +262,8 @@ level up — and it is what makes Gate 1 (§7) a real test rather than an impres
 [pyproject.toml](pyproject.toml) declares `numpy` and `opencv-python` and **does not declare
 torch at all** — it is installed ad hoc. We are on Python 3.12.12 and torch 2.12.0+cu130.
 
-If the instance silently gets a different torch, every number shifts and nothing will say why.
-Pin torch with its CUDA build, or add a lockfile. Required before the API can build an image.
+If the image silently gets a different torch, every number shifts and nothing will say why.
+Pin torch with its CUDA build, or add a lockfile. Required before the image can be built at all.
 
 ### 5.7 Teach `pick_device` about MPS
 
@@ -302,14 +302,14 @@ wall time and not training speed. Doing it silently is the only wrong answer.
 ## 6. Where the build runs
 
 Training needs **only the derived dataset**. The raw archive is required *only* to build it, and
-the build is CPU-only. So the GPU instance never has to hold client footage — provided the build
+the build is CPU-only. So the GPU task never has to hold client footage — provided the build
 runs somewhere else.
 
 **This overturns an earlier recommendation, recorded rather than quietly dropped.** The first
 version of this note proposed building locally so client footage never left our machine. With
 `production-citadel` as the source of truth that is no longer the clean option: **the build has
-to run wherever it can read prod.** Three placements work — the GPU instance between runs, a
-separate cheap CPU instance, or a local machine granted cross-account read — and the choice is
+to run wherever it can read prod.** Three placements work — the GPU task itself, a separate
+CPU-only task, or a local machine granted cross-account read — and the choice is
 mostly about who is permitted to hold client footage, not about engineering.
 
 At 1,000 shots the build is itself a substantial job and probably wants to be its own queued task
@@ -341,21 +341,24 @@ is** until we measure it. One hour, and it protects every number downstream.
 
 ## 8. Order of operations
 
-Three items have external lead times and start on day one. Everything on the right proceeds
-without waiting.
+**Lazy alpha loading (§5.1) lands before the infrastructure is provisioned**, so capacity is
+sized against the real memory profile rather than the 75 GB one. Everything else on the right
+proceeds in parallel with the requests on the left.
 
-| start immediately, in parallel | ours to do meanwhile |
+| external lead time — start day one | ours, meanwhile |
 |---|---|
-| G-family vCPU quota request | lazy alpha loading (§5.1) |
+| G-family vCPU quota request | **lazy alpha loading (§5.1) — precondition** |
 | `production-citadel` bucket policy, other account | checkpoint/resume (§5.2) |
-| KMS key policy question | manifest checksums (§5.5) |
-| staging bucket creation | pin the environment (§5.6) |
+| KMS key policy question | pin the environment (§5.6) — blocks the image |
+| ECS cluster + ECR repository | manifest checksums (§5.5) |
 | MPS test on the Mac (§2) | environment stamping (§5.4) |
+
+The staging bucket is ours to create; it is not waiting on anyone.
 
 ## 9. Open questions
 
 1. **Does `s3://production-citadel` hold ~1,000 shots?** (§1) Our archive is 50. This gates the
-   instance sizing and the schedule design.
+   capacity sizing and the schedule design.
 2. **Is our local `data/` a copy of prod, and is prod now authoritative?** Changes how Gate 1's
    result should be read — a mismatch could be a bug or could be a stale local copy.
 3. **What is the policy for layers wider than the slot cap?** (§5.3) Raise, exclude, or split.
