@@ -27,7 +27,6 @@ on demand and run for hours. ECS is the agreed target.
 ## IAM
 
 - **ECS task role** with the two S3 permissions above. No long-lived access keys.
-- **`kms:Decrypt`** on the prod key, if `production-citadel` is SSE-KMS encrypted.
 - **Task execution role** for ECR pull and CloudWatch write.
 
 ## Our API service
@@ -48,16 +47,3 @@ We expose an internal API to trigger, monitor and stop training jobs. Its role n
 
 - Base image with CUDA, or a Deep Learning container.
 - Our stack: **Python 3.12, PyTorch 2.12 (CUDA 13.0), OpenCV with OpenEXR support.**
-
----
-
-## Questions
-
-1. **What is the current G-family vCPU quota in the target region?** Often zero on new accounts
-   and slow to raise.
-2. **Is `s3://production-citadel` SSE-KMS encrypted, and who owns that account?** We need the
-   bucket policy change and possibly a KMS key policy change there.
-3. **Which region is `production-citadel` in?**
-
-**Please start the quota check and the bucket policy request now** — those are the long-lead
-items.
