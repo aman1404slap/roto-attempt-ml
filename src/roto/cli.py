@@ -71,7 +71,8 @@ def cmd_dataset(args: argparse.Namespace) -> list[Path]:
     import json
     import time
 
-    from .dataset import CropConfig, build, build_splits, discover
+    from .dataset import CropConfig, build_splits, discover
+    from .dataset.build import build
     found = discover(args.data_root)
     if args.layer:
         wanted = set(args.layer)

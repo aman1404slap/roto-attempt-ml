@@ -1,47 +1,29 @@
-"""v1.1 training: one shared network over every layer, batched a frame at a time.
+"""v2 training loop, charter S4 stage **S0**: geometry + motion, structure given.
 
-Batches are drawn from a single layer, because the shape count sets the query count and
-mixing layers in one batch would mean padding a 4-shape layer out to 1036. Each step samples
-one layer and, depending on ``sampling``, either scattered frames or adjacent pairs.
+Ported from ``roto.model.train`` at v2 Step 2. What changed is the defaults and the vocabulary;
+what did not is any loss term, because Step 2 exists to produce an *anchor*, and an anchor
+measured with a term nobody has measured before anchors nothing.
 
-How those frames are drawn turned out to matter more than it looks. A temporal term needs
-two adjacent frames in the same batch to have anything to act on, and the obvious way to get
-them -- one contiguous run -- measurably hurts: six consecutive frames of a roto layer are
-nearly the same picture, so the step carries much less information than six scattered ones.
-Sampling ``batch // 2`` anchors *with their successors* buys the adjacency the term needs
-while keeping most of the diversity. See :func:`sample_indices`.
+**The defaults are v1.1's ``final_long_v2`` / v1.3's ``HEADLINE``, unchanged**: a 3-frame
+aligned window, self-attention among shape queries, the curve term at 0.5, the temporal term at
+1.0, sqrt element weighting, and the transform head predicting the 8-number local-to-crop
+projective map at weight 0.25. That configuration is the one v1.2 recommended building on and
+the one v1.3 shipped, so a v2 number read against it differs by the **data**, which is the
+comparison Step 2 is for.
 
-The loss is in **crop pixels**: predictions live in [0,1] across the alpha, so multiplying by
-the crop's own pixel size makes one weight meaningful for every layer. Layer scales differ by
-35x in document terms -- ``px_per_norm`` runs from 124 to 4365 -- and a loss stated in those
-units would spend all its capacity on the largest layer and report that as progress.
+Two things were dropped rather than carried, both of them v1-comparability machinery with
+nothing left to be comparable to: ``affine_space='doc'`` (the lossy 6-number document-space
+target, kept in v1 only so v1's own transform rows still reproduced) and ``use_split=False``
+(kept in v1 for the single row that had to read against a pre-split result). v2's dataset
+records its split at build time and there is no pre-split v2 result, so a run that could ignore
+the split would only ever be a mistake.
 
-Four terms, all in the same unit except the affine one:
-
-* **point** -- L1 on control points, v1's only geometry term.
-* **curve** -- L1 between the *drawn polylines*, via a fixed linear map. See ``curveloss``.
-* **temporal** -- ``|dpred - dtarget|`` between adjacent frames. Punishes jitter without
-  punishing real motion, because it is the *change* that is compared, not the position.
-* **affine** -- the transform track. ``affine_space='doc'`` is v1's: L1 on the 6 document-space
-  matrix entries, lifted by 20 because they are O(1) and unitless next to a loss in pixels.
-  ``'crop'`` is v1.1's, and it removes both problems at once -- the target becomes the
-  local-to-crop projective map (:func:`~roto.geometry.crop_matrix`), which is the space
-  the picture depicts, and the loss becomes the distance the predicted transform *moves five
-  probe points*, in crop pixels. That is the same unit as the point term, so the weight stops
-  being a free parameter and the term stops being separately scaled guesswork.
-
-* **key** -- the key-timing head. Binary cross-entropy on "is this frame a keyframe for this
-  shape", against the artist's own keys. The one term here that is not in pixels and cannot
-  be: it is a probability, and its weight is set by what it is worth against the pixel terms
-  rather than derived. See ``TrainConfig.key_weight`` and ``net.RotoNet``.
-
-Only *live* shapes contribute. A shape switched off at a frame has no meaningful control
-points there: the artist left them wherever they last were, and asking the network to match
-that teaches it to memorise a value nobody draws. The key term is masked the same way, and
-for a sharper reason: keys are only ever *chosen* over a shape's live frames
-(``reconstruct.rebuild``), so a key predicted on a dead frame is unscoreable as well as
-unlearnable.
+``sample_weight`` stays configurable and stays at ``'sqrt'``. v1.3's gates named it as the next
+rung -- it is what de-prioritises a small element, and three of that round's four failing gates
+traced to one 16-shape layer -- but changing it here would mean the anchor and the rung moved
+together, and neither could then be read.
 """
+
 from __future__ import annotations
 
 import json
@@ -55,10 +37,10 @@ import torch
 import torch.nn.functional as F
 
 from ..program import AFFINE_DOF, PROJ_DOF
-from .curveloss import PolylineMaps
-from .curveloss import curve_loss as polyline_loss
-from .data import LayerData, load_dataset
-from .net import RotoNet
+from .losses import PolylineMaps
+from .losses import curve_loss as polyline_loss
+from .traindata import ElementData, canonical_order, load_dataset, query_desc
+from .net import SLOTS, TABLE, RotoNetV2
 
 
 DOC, CROP = 'doc', 'crop'
@@ -77,12 +59,12 @@ def pick_device(device: str | None = None) -> torch.device:
 
 @dataclass(slots=True)
 class TrainConfig:
-    steps: int = 6000
+    steps: int = 40000
     batch: int = 6
     lr: float = 3e-4
     dim: int = 192
     depth: int = 3
-    affine_weight: float = 20.0
+    affine_weight: float = 0.25
     """Weight on the transform term.
 
     With ``affine_space='doc'`` this has to be a lift: the entries are O(1) and unitless while
@@ -93,7 +75,7 @@ class TrainConfig:
     transform error costs what a pixel of point error costs" -- the same reading
     ``temporal_weight`` has. Leaving it at 20 there would price the transform above the
     geometry by 20x."""
-    affine_space: str = DOC
+    affine_space: str = CROP
     """``'doc'`` (v1: 6 document-space matrix entries, L1 on the entries) or ``'crop'``
     (v1.1: the 8-number local-to-crop projective map, L1 on where it puts five probe points).
 
@@ -107,17 +89,17 @@ class TrainConfig:
       and displaces ``Layer_52`` by 23.8 crop px. That is a ceiling the head could not have
       beaten however well it predicted, and it is most of why v1's head read 0.756.
     """
-    in_frames: int = 1
+    in_frames: int = 3
     """Consecutive alphas stacked as input channels. 1 reproduces v1."""
-    align_window: bool = False
+    align_window: bool = True
     """Warp each window neighbour into the anchor's crop window before stacking.
 
     Off reproduces v1.1's first ladder, where the window was tested *misaligned* and read as
-    worthless. See ``data.LayerData.window``: the crop offset twitches 1.09 crop px per step
+    worthless. See ``data.ElementData.window``: the crop offset twitches 1.09 crop px per step
     on average, which is larger than the 0.77 px of jitter the window was meant to remove, so
     the three channels disagreed about where the shape was by more than the quantity under
     test. Only meaningful when ``in_frames > 1``."""
-    self_attn: bool = False
+    self_attn: bool = True
     """Self-attention among shape queries. See ``net.SelfBlock``."""
     affine_depth: int = 0
     """Depth of the transform head's own decoder. ``0`` means ``depth``, which is v1's.
@@ -139,10 +121,10 @@ class TrainConfig:
     this archive's 9.6% positive rate lands in the same order), which is the ratio that lets
     the head learn without the geometry giving anything up. Measured as a rung rather than argued -- see
     ``scripts/train_v13.py``."""
-    key_balance: str = 'per_layer'
+    key_balance: str = 'per_element'
     """Whether the key term's positive weight is one number or one per layer.
 
-    ``'per_layer'`` is the default and the fix the first probe asked for; ``'global'`` is what
+    ``'per_element'`` is the default and the fix the first probe asked for; ``'global'`` is what
     that probe ran and is kept so the comparison stays reproducible. See
     :func:`key_positive_rates` for what the probe measured and why one global weight is
     exploitable: key density ranges 13x across these layers, and learning that spread scores
@@ -155,17 +137,99 @@ class TrainConfig:
     ``(1 - p) / p``, and it is measured rather than tuned because it is a property of the
     data. Recorded on the run summary so a run can be read against the rate it was trained
     at."""
-    curve_weight: float = 0.0
+    curve_weight: float = 0.5
     """Weight on the polyline term, relative to the point term. 0.5 was the starting point;
     the point term is kept because it is what pins down a control polygon the artist can edit,
     while the curve term is what the render actually judges."""
-    temporal_weight: float = 0.0
+    point_weight: float = 1.0
+    """Weight on the dot-L1 term. ``1.0`` is S0 and S1, where the term is the reference unit
+    every other weight is quoted against.
+
+    Charter S4 demotes it at **S2**: as the model starts inventing structure, matching the
+    artist's dots one for one stops being the right question and the curve the dots draw
+    becomes it (charter L2). Plan section 5 sets the demotion at 0.25x with the curve term
+    promoted to primary.
+
+    Split out as its own weight -- rather than scaling the other three up -- so the change is
+    one recorded field on the run rather than a reinterpretation of every other number, and so
+    ``point_px`` stays readable in crop pixels in the log while its *contribution* changes.
+
+    Measured before the S2 heads exist rather than bundled with them (rung ``s2a``): at S2
+    shape count and identity are still given, so index-wise correspondence is still exact and
+    the dot term is still legitimate. The demotion is preparation for S3's weakened
+    correspondence, and at S2 it can only cost geometry."""
+    temporal_weight: float = 1.0
     """Weight on the frame-to-frame consistency term."""
+    alive_weight: float = 0.0
+    """Weight on the lifespan term, charter S4 stage **S2**. ``0`` leaves the head off, which
+    is S0 and S1.
+
+    Like the key term this is a cross-entropy rather than a distance, so the weight is a real
+    choice and not a unit fix. 1.0 puts it at the same standing as the key term, which is where
+    the S2 rung starts; the design note's stop condition lowers it once if geometry regresses
+    beyond the seed spread, and then stops rather than searching."""
+    alive_balance: str = 'per_element'
+    """``'per_element'`` or ``'global'``, exactly as ``key_balance``, and for a sharper reason.
+
+    The live rate spans **0.093 to 1.000** across v003's trained elements. With one global
+    weight the cheapest thing for the head to learn is each element's own base rate, and a per
+    ``(element, shape)`` query row is precisely the capacity to do it -- the same exploit the
+    key head's first probe fell into, at a wider spread."""
+    alive_pos_weight: float = 0.0
+    """Positive-class weight for the lifespan term. ``0`` means *measure it from the dataset*.
+
+    ``(1 - r) / r`` at v003's 0.627 live rate is 0.60 -- below 1, because live cells are the
+    *majority* here. That is the opposite of the key term's situation and worth stating: this
+    head's degenerate answer is "always alive", not "never", and the balancing is what stops it
+    being free. An element whose shapes are always live has ``r = 1`` and no negatives at all;
+    its weight is pinned to 1.0 rather than to the ``(1-r)/r`` formula's 0, which would zero the
+    positive class and delete the element from the term."""
+    count_weight: float = 0.0
+    """Weight on the point-count cross-entropy, charter S4 stage **S2**. ``0`` leaves the head
+    off.
+
+    Reported, never gated -- see ``v2-s2-design-note.md`` section 2.4. A point count does not
+    vary with the frame and the query row does, so the row can carry it exactly and accuracy
+    here measures memory rather than perception. The head is built at S2 anyway because it and
+    its decode have to exist and be debugged somewhere, and S3 -- where identity goes away and
+    the number becomes real -- is not the place to be debugging it."""
+    count_style_weight: float = 0.0
+    """Weight on plan section 5's point-economy style statistic, ``|E[P] - P| / P``.
+
+    Charter L2 asks for point economy as a *soft statistical* target rather than a hard match,
+    so this is an L1 on the head's expected count rather than a second cross-entropy. The
+    ``/ P`` is deviation 4.3 of the design note and is measured, not chosen: plan section 5's
+    unweighted form prices one point the same at P = 68 and at P = 4, and the render does not.
+    Dropping a point costs 0.0004-0.053 soft IoU on fifteen of v003's elements and 0.42-0.50 on
+    the two whose smallest shape has four points, where a 4-point closed B-spline drops to a
+    near-degenerate 3."""
+    n_slots: int = 0
+    """Charter S4 stage **S3**: share one bank of this many shape queries across every element,
+    instead of one learned row per ``(element, shape)``. ``0`` keeps the per-element table,
+    which is S0 through S2.
+
+    256 covers v003, whose largest element has 247 shapes. It is a recorded **interface**
+    number rather than a hyperparameter -- changing it changes what a checkpoint means -- and
+    it is also the reason the deferred 9,008-shape shots re-enter at S3 rather than before: no
+    fixed maximum accommodates them, which is a fact about the design and not about the data.
+
+    Turning this on does three things at once, and they are inseparable by construction: the
+    query stops carrying identity, the *count* stops being given (a slot the alive head never
+    fires on is not a shape), and the shape-type descriptor leaves the input because it is
+    per-(element, shape) information. See ``net.QUERY_MODES``."""
+    give_point_count: bool = True
+    """Whether ``n_points`` is fed to the query as part of ``desc``. ``False`` is S2's training
+    wheel coming off.
+
+    Removing it does **not** make the count unmemorisable -- the query row can still carry it,
+    and the count loss will put it there. What removal does buy is that the count is no longer
+    handed over on a path that bypasses learning entirely, which is charter L1: at S2 the
+    declared given structure is shape count and identity, and a point count is neither."""
     holdout_every: int = 0
     """Withhold every Nth frame from training and score it separately. 0 holds nothing.
 
     Ignored when the dataset records its own split, which ``datasets/v002`` does and
-    ``datasets/v001`` does not -- see ``data.LayerData.split`` and ``use_split``."""
+    ``datasets/v001`` does not -- see ``data.ElementData.split`` and ``use_split``."""
     use_split: bool = True
     """Obey the split the dataset recorded at build time. ``False`` trains on everything.
 
@@ -174,16 +238,16 @@ class TrainConfig:
     pre-split result -- and it is a *flag on the run* rather than a second dataset, so the
     two rows differ in one recorded field and share every alpha. A run that opts out says so
     on its own checkpoint (``split_source``), so a table can never mix the two silently."""
-    sampling: str = RANDOM
+    sampling: str = 'pairs'
     """How a step's frames are drawn: ``'random'`` (v1), ``'pairs'``, or ``'runs'``.
     See :func:`sample_indices` -- the temporal term needs ``'pairs'`` to have anything to
     act on, and ``'runs'`` is kept only because its cost is worth having on record."""
-    sample_weight: str = 'frames'
+    sample_weight: str = 'sqrt'
     """``'frames'`` (v1: proportional to frame count) or ``'sqrt'`` (sqrt(frames * shapes)).
 
     v1's weighting let the two giant layers dominate wall-clock while the tiny ones overfit.
     ``'sqrt'`` compresses that range; which one wins is measured, not assumed."""
-    log_every: int = 250
+    log_every: int = 500
     seed: int = 0
     warmup: int = 200
     device: str | None = None
@@ -236,27 +300,48 @@ def sample_indices(rng: np.random.Generator, pool: np.ndarray, batch: int,
     return np.concatenate([[s, s + 1] for s in np.sort(chosen)])
 
 
-def _batch(el: LayerData, idx: np.ndarray, shape_base: int = 0, group_base: int = 0,
-           in_frames: int = 1, device: torch.device | str = 'cpu',
-           align: bool = False) -> dict[str, torch.Tensor]:
+def _batch(el: ElementData, idx: np.ndarray, shape_base: int = 0, group_base: int = 0,
+           in_frames: int = 3, device: torch.device | str = 'cpu',
+           align: bool = False, give_point_count: bool = True,
+           n_slots: int = 0, perm: np.ndarray | None = None) -> dict[str, torch.Tensor]:
     a = torch.from_numpy(el.window(idx, in_frames, align))
     to = lambda t: t.to(device, non_blocking=True)
-    return {
+    # S3: targets are reordered into the canonical order the shared slots are addressed by,
+    # and the *geometry* targets stay n_shapes wide rather than being padded to n_slots --
+    # padding a (F, 256, 68, 3, 2) float array would cost 392 MB on a 94-frame element for
+    # rows that are masked out of every geometry term anyway. Only the alive target is padded,
+    # because that is the one head with something to say about an empty slot.
+    sl = perm if perm is not None else slice(None)
+    b = {
         'alpha': to(a),
-        'points': to(torch.from_numpy(el.points[idx])),
-        'live': to(torch.from_numpy(el.live[idx])),
+        'points': to(torch.from_numpy(el.points[idx][:, sl])),
+        'live': to(torch.from_numpy(el.live[idx][:, sl])),
         'affine': to(torch.from_numpy(el.affine[idx])),
         'proj_crop': to(torch.from_numpy(el.proj_crop[idx])),
         'probe': to(torch.from_numpy(el.probe_local)),
         'group_live': to(torch.from_numpy(el.group_live[idx])),
         'frames': to(torch.from_numpy(el.frames[idx].astype(np.int64))),
-        'key_mask': to(torch.from_numpy(el.key_mask[idx])) if el.key_mask.size
+        'key_mask': to(torch.from_numpy(el.key_mask[idx][:, sl])) if el.key_mask.size
         else to(torch.zeros((len(idx), el.n_shapes), dtype=torch.bool)),
-        'shape_ids': to((torch.arange(el.n_shapes) + shape_base)[None].expand(len(idx), -1)),
+        'shape_ids': to((torch.arange(n_slots or el.n_shapes)
+                         + (0 if n_slots else shape_base))[None].expand(len(idx), -1)),
         'group_ids': to((torch.arange(el.n_groups) + group_base)[None].expand(len(idx), -1)),
-        'desc': to(torch.from_numpy(el.desc)[None].expand(len(idx), -1, -1)),
-        'point_mask': to(torch.from_numpy(el.point_mask)[None]),
+        'desc': to(torch.from_numpy(query_desc(el, give_point_count)[sl])[None]
+                   .expand(len(idx), -1, -1)),
+        'point_mask': to(torch.from_numpy(el.point_mask[sl])[None]),
+        # The point-count head's target, ``(S,)``. Not per frame: a shape's point count is
+        # fixed for its whole track -- ``ir.Shape.validate`` raises if it is not -- and that
+        # invariance is the whole difficulty with the head. See ``count_term``.
+        'point_count': to(torch.from_numpy(el.n_points_per_shape[sl].astype(np.int64))),
     }
+    if n_slots:
+        # The existence signal. A slot past this element's shape count is a slot with nothing
+        # in it, and "never alive" is how the model is asked to say so -- which is why S3
+        # needs no separate no-object class: the S2 lifespan head already carries it.
+        alive = np.zeros((len(idx), n_slots), bool)
+        alive[:, :el.n_shapes] = el.live[idx][:, sl]
+        b['alive_target'] = to(torch.from_numpy(alive))
+    return b
 
 
 def temporal_term(pred: torch.Tensor, b: dict[str, torch.Tensor],
@@ -363,7 +448,7 @@ def affine_temporal_term(pred: torch.Tensor, target: torch.Tensor, probe: torch.
     return (d * m).sum() / n * out_px
 
 
-def key_positive_rate(els: Sequence[LayerData]) -> float:
+def key_positive_rate(els: Sequence[ElementData]) -> float:
     """Fraction of *live* (frame, shape) cells the artist put a key on, over the dataset.
 
     Measured rather than assumed, and reported, because it is what sets ``key_pos_weight``
@@ -380,7 +465,7 @@ def key_positive_rate(els: Sequence[LayerData]) -> float:
     return keys / live if live else 0.0
 
 
-def key_positive_rates(els: Sequence[LayerData]) -> dict[str, float]:
+def key_positive_rates(els: Sequence[ElementData]) -> dict[str, float]:
     """The same rate **per layer**, which is the number that made the first probe fail.
 
     Measured on ``datasets/v002``, key density ranges from **0.037** on ``FAM green`` to
@@ -403,7 +488,7 @@ def key_positive_rates(els: Sequence[LayerData]) -> dict[str, float]:
         if not e.key_mask.size:
             continue
         live = int(e.live.sum())
-        out[e.layer_id] = (int((e.key_mask & e.live).sum()) / live) if live else 0.0
+        out[e.element_id] = (int((e.key_mask & e.live).sum()) / live) if live else 0.0
     return out
 
 
@@ -426,11 +511,118 @@ def key_term(logits: torch.Tensor, target: torch.Tensor, live: torch.Tensor,
     return loss
 
 
+def live_rate(els: Sequence[ElementData], n_slots: int = 0) -> float:
+    """Fraction of all ``(frame, shape)`` cells on which the artist has the shape on screen.
+
+    The lifespan head's base rate, and the mirror image of the key head's. Keys are 32% of
+    *live* cells, so that head's degenerate answer is "never"; live cells are **63%** of all
+    cells, so this head's degenerate answer is "always" -- and unlike the key head's, the
+    degenerate answer here is a well-known trivial baseline that costs 0.0971 soft IoU. The
+    denominator is every cell, because that is what the term is computed over: a head asked to
+    predict which frames a shape is on screen for cannot be masked by which frames it is on
+    screen for.
+    """
+    live = cells = 0
+    for e in els:
+        live += int(e.live.sum())
+        # With shared slots the denominator is every *slot*, not every shape: the empty slots
+        # are cells the head has to get right too, and they are the majority. On v003 this
+        # moves the rate from 0.627 to about 0.04, which flips the head's degenerate answer
+        # from "always alive" back to "never" -- the same trap the key head fell into, and the
+        # reason the weight is measured rather than carried over from S2.
+        cells += int(len(e.frames)) * (n_slots or e.n_shapes)
+    return live / cells if cells else 0.0
+
+
+def live_rates(els: Sequence[ElementData], n_slots: int = 0) -> dict[str, float]:
+    """The same rate **per element**, which is what the balancing needs.
+
+    On ``datasets/v003`` it spans **0.093 to 1.000** -- wider than the 13x key-density spread
+    that made the key head's first probe fail, and with the same exploit available: one global
+    weight makes "learn each element's base rate and fire at it" the cheapest way down, and a
+    per ``(element, shape)`` query row is exactly the capacity to do it.
+
+    Four of the seventeen trained elements sit at 1.000 -- every shape on screen on every
+    frame. Those have no negative class at all, so ``(1-r)/r`` is 0 for them, which would zero
+    their positive loss and delete them from the term. :func:`positive_weights` pins those to
+    1.0 instead.
+    """
+    return {e.element_id: int(e.live.sum()) / (len(e.frames) * (n_slots or e.n_shapes))
+            for e in els}
+
+
+def positive_weights(rates: dict[str, float]) -> dict[str, float]:
+    """``(1 - r) / r`` per element, with the degenerate rates pinned to 1.0.
+
+    ``r = 1`` means no negatives exist, so no correction is meaningful and the formula's 0
+    would silently drop the element; ``r = 0`` means no positives exist, and the formula
+    diverges. Both are real on this dataset -- five elements are always live -- so both are
+    handled here rather than at the one call site that happens to have hit them.
+    """
+    return {k: ((1.0 - v) / v if 0.0 < v < 1.0 else 1.0) for k, v in rates.items()}
+
+
+def alive_term(logits: torch.Tensor, target: torch.Tensor, pos_weight: float) -> torch.Tensor:
+    """Class-balanced BCE on "is this shape on screen at this frame", over **every** cell.
+
+    The one structural difference from :func:`key_term`, and the reason this is a separate
+    function rather than a second call: the key term is masked to live cells, and this term
+    cannot be. Masking a lifespan loss by the lifespan would leave it predicting only the
+    frames where the answer is already yes.
+
+    Nothing here knows that the two mistakes cost differently -- omitting a live shape is
+    worth 3.2x drawing a dead one, measured in ``v2-s2-design-note.md`` section 2.3. That
+    asymmetry is applied at **decode**, in ``reconstruct.alive_mask``, rather than here: a
+    BCE skewed to one side moves the probabilities themselves, which would then be miscalibrated
+    for every threshold the sweep tries. The loss learns the probability; the decode prices the
+    mistake.
+    """
+    w = logits.new_tensor(float(pos_weight))
+    return F.binary_cross_entropy_with_logits(
+        logits, target.to(logits.dtype), pos_weight=w, reduction='mean')
+
+
+def count_term(logits: torch.Tensor, target: torch.Tensor,
+               style_weight: float = 0.0) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cross-entropy on the point count, plus plan section 5's point-economy style statistic.
+
+    ``logits`` is ``(B, S, max_points + 1)`` with class index == the count; ``target`` is
+    ``(S,)``. The count does not vary with the frame, so every row of the batch carries the
+    same target and the term is averaged over the batch as well -- which costs nothing and
+    keeps the head's gradient at the same scale as the per-frame ones.
+
+    The style statistic is ``|E[P] - P| / P`` on the head's *expected* count, which is
+    differentiable where an argmax is not. Two decisions in it:
+
+    * **expectation, not argmax.** Charter L2 asks for point economy as a soft statistical
+      target rather than a hard match, and an expectation is what makes "about the right
+      number of points" expressible at all.
+    * **divided by P.** Deviation 4.3 of the design note. Plan section 5's unweighted form
+      prices one point the same at P = 68 and at P = 4, and the render does not: dropping a
+      point costs 0.0004-0.053 soft IoU on fifteen of v003's elements and 0.42-0.50 on the two
+      whose smallest shape has four points, where a 4-point closed B-spline drops to a
+      near-degenerate 3.
+    """
+    B, S, C = logits.shape
+    tgt = target[None].expand(B, -1).reshape(-1)
+    ce = F.cross_entropy(logits.reshape(-1, C), tgt, reduction='mean')
+    if not style_weight:
+        return ce, logits.new_zeros(())
+    grid = torch.arange(C, device=logits.device, dtype=logits.dtype)
+    expected = (logits.softmax(-1) * grid).sum(-1)                    # (B, S)
+    style = ((expected - target[None]).abs() / target.clamp(min=1)[None]).mean()
+    return ce, style
+
+
 def losses(pred_pts: torch.Tensor, pred_aff: torch.Tensor, b: dict[str, torch.Tensor],
            out_px: float, cfg: TrainConfig,
            maps: PolylineMaps | None = None,
            pred_key: torch.Tensor | None = None,
-           key_pos_weight: float | None = None) -> tuple[torch.Tensor, dict[str, float]]:
+           key_pos_weight: float | None = None,
+           pred_alive: torch.Tensor | None = None,
+           alive_pos_weight: float | None = None,
+           pred_count: torch.Tensor | None = None
+           ) -> tuple[torch.Tensor, dict[str, float]]:
     mask = (b['point_mask'] & b['live'][..., None, None]).unsqueeze(-1)
     n = mask.sum().clamp(min=1)
     point_px = (((pred_pts - b['points']).abs() * mask).sum() / n) * out_px
@@ -443,7 +635,7 @@ def losses(pred_pts: torch.Tensor, pred_aff: torch.Tensor, b: dict[str, torch.Te
     else:
         aff = (pred_aff - b['affine']).abs().mean()
         parts['affine'] = float(aff.detach())
-    total = point_px + cfg.affine_weight * aff
+    total = cfg.point_weight * point_px + cfg.affine_weight * aff
 
     if cfg.curve_weight and maps is not None and maps.groups:
         curve_px = polyline_loss(pred_pts, b['points'], b['live'], maps, out_px)
@@ -463,6 +655,10 @@ def losses(pred_pts: torch.Tensor, pred_aff: torch.Tensor, b: dict[str, torch.Te
 
     if cfg.key_weight and pred_key is not None:
         w = cfg.key_pos_weight if key_pos_weight is None else key_pos_weight
+        # Sliced to the real shapes: a slot with nothing in it has no artist keys to find,
+        # and scoring it would pay the head for staying quiet where quiet is free.
+        n_real = b['live'].shape[1]
+        pred_key = pred_key[:, :n_real]
         key_px = key_term(pred_key, b['key_mask'], b['live'], w)
         total = total + cfg.key_weight * key_px
         parts['key_bce'] = float(key_px.detach())
@@ -475,11 +671,40 @@ def losses(pred_pts: torch.Tensor, pred_aff: torch.Tensor, b: dict[str, torch.Te
             parts['key_prec'] = float(hit.sum() / fired.sum().clamp(min=1))
             parts['key_rec'] = float(hit.sum() / want.sum().clamp(min=1))
 
+    if cfg.alive_weight and pred_alive is not None:
+        w = cfg.alive_pos_weight if alive_pos_weight is None else alive_pos_weight
+        tgt = b.get('alive_target')
+        if tgt is None:
+            tgt = b['live']
+        alive_bce = alive_term(pred_alive[:, :tgt.shape[1]], tgt, w)
+        total = total + cfg.alive_weight * alive_bce
+        parts['alive_bce'] = float(alive_bce.detach())
+        with torch.no_grad():
+            fired, want = pred_alive[:, :tgt.shape[1]] > 0, tgt
+            # The two error rates, over every cell, logged rather than optimised -- and split,
+            # because they are not worth the same. A false negative costs 3.2x a false
+            # positive at the render, so a falling BCE that is trading recall for precision is
+            # going the wrong way and only these two columns would show it.
+            parts['alive_fp'] = float((fired & ~want).sum() / want.numel())
+            parts['alive_fn'] = float((~fired & want).sum() / want.numel())
+            parts['alive_acc'] = float((fired == want).sum() / want.numel())
+
+    if cfg.count_weight and pred_count is not None:
+        pred_count = pred_count[:, :b['live'].shape[1]]
+        ce, style = count_term(pred_count, b['point_count'], cfg.count_style_weight)
+        total = total + cfg.count_weight * ce + cfg.count_style_weight * style
+        parts['count_ce'] = float(ce.detach())
+        if cfg.count_style_weight:
+            parts['count_style'] = float(style.detach())
+        with torch.no_grad():
+            pred = pred_count.argmax(-1)
+            parts['count_acc'] = float((pred == b['point_count'][None]).float().mean())
+
     parts['total'] = float(total.detach())
     return total, parts
 
 
-def layer_weights(els: Sequence[LayerData], mode: str) -> np.ndarray:
+def element_weights(els: Sequence[ElementData], mode: str) -> np.ndarray:
     if mode == 'sqrt':
         w = np.array([np.sqrt(len(e.frames) * e.n_shapes) for e in els], float)
     elif mode == 'frames':
@@ -509,7 +734,7 @@ def train(dataset_root: str | Path, out_dir: str | Path,
     # gradient, and the checkpoint records which layers existed.
     all_els = load_dataset(dataset_root, with_local=False)   # training never reads local
     els = [e for e in all_els if e.in_train or not cfg.use_split]
-    withheld = [e.layer_id for e in all_els if not e.in_train] if cfg.use_split else []
+    withheld = [e.element_id for e in all_els if not e.in_train] if cfg.use_split else []
     if not cfg.use_split:
         for e in els:                       # drop the recorded frame split as well
             e.split_train = np.zeros(0, np.int64)
@@ -520,13 +745,23 @@ def train(dataset_root: str | Path, out_dir: str | Path,
     # (layer, shape) rather than per index. See net.RotoNet.
     shape_base, group_base, ns, ng = {}, {}, 0, 0
     for e in els:
-        shape_base[e.layer_id], group_base[e.layer_id] = ns, ng
+        shape_base[e.element_id], group_base[e.element_id] = ns, ng
         ns += e.n_shapes
         ng += e.n_groups
     max_shapes, max_groups = ns, ng
+    # S3: the query bank is the slot count, shared by every element, rather than the running
+    # total of per-element rows. 675 rows becomes 256, and none of them means a named shape.
+    perms = {e.element_id: canonical_order(e) for e in els} if cfg.n_slots else {}
+    if cfg.n_slots:
+        widest = max(e.n_shapes for e in els)
+        if widest > cfg.n_slots:
+            raise ValueError(f'n_slots={cfg.n_slots} but {widest} shapes in one element; a '
+                             'slot bank that cannot hold the widest element silently drops '
+                             'its tail')
+        max_shapes = cfg.n_slots
     max_points = max(e.points.shape[2] for e in els)
     max_coords = max(e.points.shape[3] for e in els)
-    splits = {e.layer_id: e.split(cfg.holdout_every) for e in els}
+    splits = {e.element_id: e.split(cfg.holdout_every) for e in els}
     n_held = sum(len(h) for _, h in splits.values())
     recorded = cfg.use_split and any(len(e.split_train) for e in els)
     affine_dim = PROJ_DOF if cfg.affine_space == CROP else AFFINE_DOF
@@ -538,7 +773,7 @@ def train(dataset_root: str | Path, out_dir: str | Path,
         rate = key_positive_rate(els)
         if not cfg.key_pos_weight:
             cfg = replace(cfg, key_pos_weight=(1.0 - rate) / rate if rate else 1.0)
-        if cfg.key_balance == 'per_layer':
+        if cfg.key_balance == 'per_element':
             rates = key_positive_rates(els)
             key_w = {k: ((1.0 - v) / v if v else 1.0) for k, v in rates.items()}
             lo, hi = min(key_w.values()), max(key_w.values())
@@ -553,10 +788,43 @@ def train(dataset_root: str | Path, out_dir: str | Path,
                   f'base rate -- see key_positive_rates')
         else:
             raise ValueError(f'unknown key_balance {cfg.key_balance!r}, '
-                             "want 'per_layer' or 'global'")
-    print(f'{len(els)} layers | {sum(len(e.frames) for e in els)} frames '
+                             "want 'per_element' or 'global'")
+    # The lifespan term's positive weight, on the same measured-never-tuned rule. The mirror
+    # image of the key head's: live cells are the *majority* here, so the correction is below
+    # 1 and the degenerate answer it guards against is "always alive" rather than "never".
+    alive_w: dict[str, float] = {}
+    if cfg.alive_weight:
+        rate = live_rate(els, cfg.n_slots)
+        if not cfg.alive_pos_weight:
+            cfg = replace(cfg, alive_pos_weight=(1.0 - rate) / rate if 0 < rate < 1 else 1.0)
+        rates = live_rates(els, cfg.n_slots)
+        if cfg.alive_balance == 'per_element':
+            alive_w = positive_weights(rates)
+            lo, hi = min(alive_w.values()), max(alive_w.values())
+            n_full = sum(1 for v in rates.values() if v >= 1.0)
+            print(f'lifespan head: shapes are on screen on {100 * rate:.1f}% of all '
+                  f'(frame, shape) cells, and {100 * min(rates.values()):.1f}%-'
+                  f'{100 * max(rates.values()):.1f}% per element -- so the positive weight is '
+                  f'balanced per element, {lo:.2f} to {hi:.2f} (measured, not tuned)'
+                  + (f'; {n_full} element(s) are always live and are pinned to 1.0, since '
+                     '(1-r)/r would be 0 and delete them from the term' if n_full else ''))
+        elif cfg.alive_balance == 'global':
+            print(f'lifespan head: {100 * rate:.1f}% of all cells are live, so '
+                  f'alive_pos_weight = {cfg.alive_pos_weight:.2f} globally. NOTE: one global '
+                  'weight is exploitable at a 0.093-1.000 live-rate spread -- see live_rates')
+        else:
+            raise ValueError(f'unknown alive_balance {cfg.alive_balance!r}, '
+                             "want 'per_element' or 'global'")
+    if cfg.count_weight:
+        counts = np.concatenate([e.n_points_per_shape for e in els])
+        print(f'point-count head: {len(counts)} shapes, {len(set(counts.tolist()))} distinct '
+              f'counts over {counts.min()}-{counts.max()}, {max_points + 1} classes. '
+              f'REPORTED, NOT GATED -- the query row is per (element, shape) and a count does '
+              f'not vary with the frame, so accuracy here measures memory (see the design note)'
+              + ('' if cfg.give_point_count else '; n_points is out of the query input'))
+    print(f'{len(els)} elements | {sum(len(e.frames) for e in els)} frames '
           f'({n_held} held out{", from the dataset\'s own split" if recorded else ""})'
-          f'{f" | {len(withheld)} layer(s) withheld entirely" if withheld else ""} '
+          f'{f" | {len(withheld)} element(s) withheld entirely" if withheld else ""} '
           f'| queries {max_shapes} shape / {max_groups} group  '
           f'Pmax {max_points} Cmax {max_coords} | {device} | window {cfg.in_frames}'
           f'{" aligned" if cfg.align_window and cfg.in_frames > 1 else ""} '
@@ -567,18 +835,22 @@ def train(dataset_root: str | Path, out_dir: str | Path,
     if withheld:
         print('  withheld from training: ' + ', '.join(withheld))
 
-    net = RotoNet(max_shapes, max_groups, max_points, max_coords, cfg.dim, cfg.depth,
+    net = RotoNetV2(max_shapes, max_groups, max_points, max_coords, cfg.dim, cfg.depth,
                   in_frames=cfg.in_frames, self_attn=cfg.self_attn,
                   affine_dim=affine_dim, align_window=cfg.align_window,
                   affine_depth=cfg.affine_depth or None,
-                  key_head=bool(cfg.key_weight)).to(device)
+                  key_head=bool(cfg.key_weight), query_mode=SLOTS if cfg.n_slots else TABLE,
+                  alive_head=bool(cfg.alive_weight),
+                  count_head=bool(cfg.count_weight or cfg.count_style_weight),
+                  desc_dim=3 if cfg.give_point_count else 2).to(device)
     n_params = sum(p.numel() for p in net.parameters())
-    maps = {e.layer_id: PolylineMaps(e.n_points_per_shape, e.closed_per_shape,
+    maps = {e.element_id: PolylineMaps(e.n_points_per_shape, e.closed_per_shape,
                                      e.coords_per_shape, device)
             for e in els} if cfg.curve_weight else {}
     if maps:
         print(f'  curve loss covers {sum(m.n_shapes_covered for m in maps.values())} '
-              f'of {max_shapes} shapes (Bezier and <3-point shapes sit out)')
+              f'of {sum(e.n_shapes for e in els)} shapes '
+              f'(Bezier and <3-point shapes sit out)')
 
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats(device)
@@ -587,7 +859,7 @@ def train(dataset_root: str | Path, out_dir: str | Path,
         opt, lambda s: min(1.0, (s + 1) / cfg.warmup)
         * (0.5 * (1 + np.cos(np.pi * min(1.0, s / cfg.steps)))))
 
-    weights = layer_weights(els, cfg.sample_weight)
+    weights = element_weights(els, cfg.sample_weight)
     state = TrainState()
     t0 = time.time()
     run: dict[str, list[float]] = {}
@@ -595,14 +867,18 @@ def train(dataset_root: str | Path, out_dir: str | Path,
     for step in range(cfg.steps):
         ei = int(rng.choice(len(els), p=weights))
         el = els[ei]
-        idx = sample_indices(rng, splits[el.layer_id][0], cfg.batch, cfg.sampling)
-        b = _batch(el, idx, shape_base[el.layer_id], group_base[el.layer_id],
-                   cfg.in_frames, device, cfg.align_window)
+        idx = sample_indices(rng, splits[el.element_id][0], cfg.batch, cfg.sampling)
+        b = _batch(el, idx, shape_base[el.element_id], group_base[el.element_id],
+                   cfg.in_frames, device, cfg.align_window, cfg.give_point_count,
+                   cfg.n_slots, perms.get(el.element_id))
 
-        pts, aff, klog = net(b['alpha'], b['shape_ids'], b['group_ids'], b['desc'])
-        pts = pts[:, :, :el.points.shape[2], :el.points.shape[3]]
-        loss, parts = losses(pts, aff, b, el.out_px, cfg, maps.get(el.layer_id), klog,
-                             key_w.get(el.layer_id))
+        pred = net(b['alpha'], b['shape_ids'], b['group_ids'], b['desc'])
+        # Geometry terms read the real shapes only; the alive head keeps all the slots,
+        # because an empty slot is exactly what it is there to recognise.
+        pts = pred.points[:, :el.n_shapes, :el.points.shape[2], :el.points.shape[3]]
+        loss, parts = losses(pts, pred.affine, b, el.out_px, cfg, maps.get(el.element_id),
+                             pred.key, key_w.get(el.element_id),
+                             pred.alive, alive_w.get(el.element_id), pred.count)
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -623,6 +899,13 @@ def train(dataset_root: str | Path, out_dir: str | Path,
             if 'key_bce' in row:
                 extra += (f'  key {row["key_bce"]:5.3f} '
                           f'(P {row["key_prec"]:.2f} R {row["key_rec"]:.2f})')
+            if 'alive_bce' in row:
+                # FP and FN separately, never as one accuracy: they cost 1:3.2 at the render.
+                extra += (f'  alive {row["alive_bce"]:5.3f} '
+                          f'(acc {row["alive_acc"]:.3f} FP {row["alive_fp"]:.3f} '
+                          f'FN {row["alive_fn"]:.3f})')
+            if 'count_ce' in row:
+                extra += f'  count {row["count_ce"]:5.3f} (acc {row["count_acc"]:.3f})'
             tr = (f'  transform {row["affine_px"]:7.3f}px' if 'affine_px' in row
                   else f'  affine {row["affine"]:.5f}')
             print(f'  step {row["step"]:>5}  point {row["point_px"]:7.3f}px'
@@ -637,12 +920,14 @@ def train(dataset_root: str | Path, out_dir: str | Path,
                  'in_frames': cfg.in_frames, 'self_attn': cfg.self_attn,
                  'affine_dim': affine_dim, 'align_window': cfg.align_window,
                  'affine_depth': net.affine_depth,
-                 'key_head': net.key_head},
+                 'key_head': net.key_head, 'alive_head': net.alive_head,
+                 'count_head': net.count_head, 'desc_dim': net.desc_dim,
+                 'query_mode': net.query_mode},
         'config': asdict(cfg),
-        'layers': [e.layer_id for e in els],
+        'elements': [e.element_id for e in els],
         # What this run was *not* allowed to see, on the checkpoint rather than only in the
         # dataset, so a scored run can be read without also having the dataset to hand.
-        'withheld_layers': withheld,
+        'withheld_elements': withheld,
         'dataset': str(dataset_root),
         'split_source': 'dataset' if recorded else 'holdout_every',
         'shape_base': shape_base,
@@ -661,9 +946,13 @@ def train(dataset_root: str | Path, out_dir: str | Path,
                'withheld_layers': withheld, 'dataset': str(dataset_root),
                'split_source': 'dataset' if recorded else 'holdout_every',
                'key_positive_rate': key_positive_rate(els) if cfg.key_weight else None,
-               'key_positive_rate_per_layer': (key_positive_rates(els) if cfg.key_weight
+               'key_positive_rate_per_element': (key_positive_rates(els) if cfg.key_weight
                                                else None),
-               'key_pos_weight_per_layer': key_w or None,
+               'key_pos_weight_per_element': key_w or None,
+               'live_rate': live_rate(els, cfg.n_slots) if cfg.alive_weight else None,
+               'live_rate_per_element': (live_rates(els, cfg.n_slots) if cfg.alive_weight
+                                        else None),
+               'alive_pos_weight_per_element': alive_w or None,
                'frames': sum(len(e.frames) for e in els), 'frames_held_out': n_held,
                'device': str(device),
                'device_name': (torch.cuda.get_device_name(device)

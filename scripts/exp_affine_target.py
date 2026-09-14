@@ -29,7 +29,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 
 from roto.model.data import load_element                                # noqa: E402
-from roto.model.geometry import local_to_crop                           # noqa: E402
+from roto.geometry import local_to_crop                           # noqa: E402
 from roto.model.reconstruct import (affine_doc, score_doc,              # noqa: E402
                                     transform_matrices)
 

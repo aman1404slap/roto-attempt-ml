@@ -23,7 +23,7 @@ import torch
 
 from roto.ir import sample
 from roto.model.data import load_element
-from roto.model.geometry import crop_matrix, local_to_crop
+from roto.geometry import crop_matrix, local_to_crop
 from roto.model.net import RotoNet
 from roto.model.reconstruct import (ARTIST, PREDICTED, RebuildConfig, assemble,
                                     predicted_shape_matrices, to_local, with_transforms)

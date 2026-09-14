@@ -1,55 +1,35 @@
-"""Model output -> a real spline program -> pixels, scored against the layer's own alpha.
+"""v2 reconstruction and scoring: checkpoint -> shapes -> rendered matte -> number.
 
-This is the step that decides whether the model worked, and it is deliberately the strictest
-reading available. The network's per-frame geometry is converted back to local coordinates,
-the keyframe selector picks which frames become keys, a ``RotoDoc`` is rebuilt from those
-keys alone, and that document is *rendered* and compared to the clean alpha the network was
-given.
+Ported from ``roto.model.reconstruct`` at v2 Step 2, with v2's element vocabulary and v2's
+loaders. The pipeline is unchanged, because Step 2 exists to produce an anchor and an anchor
+measured a new way anchors nothing.
 
-Scoring the rendered result rather than the control points is the whole point. A low point
-error can still draw the wrong picture -- a handful of points on a small shape can be badly
-wrong while the mean stays flattering -- and a keyframe set that looks sparse can interpolate
-into something an artist would reject. Rendering collapses geometry, keys, and lifespan into
-the single question that matters: does it look like the matte.
+The path, and why it has this many stages:
 
-The render must be at the **dataset's own supersample**. Scoring a prediction rendered at
-supersample 2 against a target written at 4 disagrees on every anti-aliased boundary pixel,
-which is precisely what soft IoU is built to notice: re-rendering the *artist's own shapes*
-that way scores 0.953-0.995 instead of 1.000. Every v1 number carried that handicap.
+1. the network predicts control points in **crop space** and a transform track per group
+2. crop points are mapped back to the IR's **local normalised** coordinates, exactly and in
+   closed form (:mod:`roto.geometry`)
+3. the dense per-frame track is reduced to **sparse keyframes** by a DP that spends a key only
+   where interpolation would otherwise drift past a tolerance (:mod:`roto.keys`)
+4. the result is a real IR, rendered by the same renderer that drew the target, and scored
+   against the stored alpha
 
-What is teacher-forced, and therefore not claimed: the shape breakdown (how many shapes,
-their point counts, their groups), each shape's lifespan, and the layer transform track. The
-network supplies the geometry; ``roto.keys`` supplies the timing. ``RebuildConfig.
-predicted_affine`` puts the transform head's own output on the table instead -- see
-``affine_doc``.
-
-**``RebuildConfig.motion`` is the one that drops the teacher-forcing entirely**, and it is a
-different measurement from ``predicted_affine`` rather than a stronger version of it.
-``predicted_affine`` isolates the head: the artist's own control points, moved by the
-predicted track, so the number is *pure motion error* with no geometry error in front of it.
-``motion='predicted'`` asks the question the roadmap actually has to answer -- predicted
-geometry *and* predicted motion, nothing given but the shape breakdown and the lifespans.
-
-Those two are not the same number, and the reason is worth stating because it looks like it
-should cancel. Points are regressed in crop space and converted to local by inverting the
-layer matrix the renderer then re-applies, so if nothing intervened, a transform error would
-divide straight back out and the picture would be identical to the teacher-forced one. What
-intervenes is the **keyframe stage**: keys are chosen and values fitted on the *local* track,
-and inverting a wrong matrix gives a differently-shaped local track, which is sparsified
-differently. So the end-to-end cost of predicted motion is exactly what survives that
-sparsification, and it has to be measured rather than reasoned about.
+Stage 3 is the one that makes the number an honest one: a model that emits every frame as a key
+reproduces the matte and is useless to an artist, so key economy is reported beside soft IoU
+rather than after it.
 """
+
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Sequence
 
 import numpy as np
 import torch
 
-from ..dataset import load_alpha
+from .build import load_alpha
 from ..metrics import iou, soft_iou
 from ..ir import Key, RotoDoc
 from ..keys import f1 as key_f1
@@ -58,16 +38,76 @@ from ..keys.refit import refit_key_values
 from ..program import PROJ_DOF, matrix_from_affine, matrix_from_proj
 from ..render.raster import config_from_meta, render_union
 from ..sfx.json_ir import from_json_ir
-from .data import LayerData, load_element
+from .traindata import ElementData, canonical_order, load_element, query_desc
 from ..geometry import crop_to_local
-from .net import RotoNet
-from .smoothing import BOXCAR, smooth_track
+from .net import RotoNetV2
+from .smoothing import SAVGOL, smooth_track
 
 ARTIST, PREDICTED = 'artist', 'predicted'
 MOTION_SOURCES = (ARTIST, PREDICTED)
 """Whose layer-transform track a reconstruction is built and rendered through."""
 
-DEFAULT_TOL_PX = 1.0
+STRUCTURE_SOURCES = (ARTIST, PREDICTED)
+"""Whose lifespans and point counts a reconstruction is built from. Charter S4 stage S2 moves
+both from ``'artist'`` to ``'predicted'``; the artist's stay selectable so the two can be read
+against each other on one checkpoint, which is how the cost of each is isolated."""
+
+
+def alive_mask(prob: np.ndarray, on: float = 0.5, off: float = 0.2,
+               min_gap: int = 0) -> np.ndarray:
+    """``(F, S)`` probabilities -> ``(F, S)`` bool, by hysteresis along the frame axis.
+
+    A shape switches **on** when its probability rises above ``on`` and switches **off** only
+    when it falls below ``off``, so a track that dips briefly mid-span does not blink out. With
+    ``on == off`` this is a plain threshold.
+
+    **The two thresholds are not symmetric, and the asymmetry is measured rather than chosen.**
+    ``v2-s2-design-note.md`` section 2.3: on this dataset, omitting a shape that should be on
+    screen costs 3.2x drawing one that should not, at 1% of cells, and 7.3x at 10%. The reason
+    is that a layer's matte is a **union** -- a dead shape's control points sit wherever the
+    artist last left them, usually still inside the blob the live shapes already draw, so
+    drawing it often changes nothing; an omitted live shape leaves a hole nothing fills. So
+    ``off`` sits well below ``on``: easy to switch on, hard to switch off.
+
+    ``min_gap`` closes dead runs shorter than that many frames. Same argument, applied to the
+    other axis: filling a spurious gap is a cheap false positive, and the corresponding
+    operation on the other side -- deleting a short *live* run -- would be an expensive false
+    negative, so it is deliberately not offered. All three are swept on held-out frames only,
+    which is the rule that decided the key-value refit at Step 2c.
+
+    Both endpoints matter more than the middle: with 509 on/off transitions on v003, moving
+    every boundary by a single frame costs 0.0102 soft IoU late and 0.0374 early -- the whole
+    of S2's render budget, or 3.7x it.
+    """
+    if on < off:
+        raise ValueError(f'alive_on ({on}) must be >= alive_off ({off}); the hysteresis is '
+                         'meant to make a shape harder to switch off than on')
+    F, S = prob.shape
+    out = np.zeros((F, S), bool)
+    state = prob[0] > on
+    out[0] = state
+    for f in range(1, F):
+        # Alive stays alive until it drops under `off`; dead stays dead until it clears `on`.
+        state = np.where(state, prob[f] > off, prob[f] > on)
+        out[f] = state
+    if min_gap > 0:
+        for si in range(S):
+            col = out[:, si]
+            f = 0
+            while f < F:
+                if col[f]:
+                    f += 1
+                    continue
+                start = f
+                while f < F and not col[f]:
+                    f += 1
+                # Interior gaps only: a run of dead frames that reaches either end of the
+                # track is the shape not having started or having finished, not a dropout.
+                if start > 0 and f < F and (f - start) < min_gap:
+                    col[start:f] = True
+    return out
+
+DEFAULT_TOL_PX = 0.2
 """Keyframe tolerance, in crop pixels.
 
 On *ground-truth* tracks the best tolerance is 0.1 px. On *predicted* tracks that value is
@@ -84,8 +124,22 @@ model peaks at a 13-frame window and 0.5 px, while the converged v1.1 model peak
 13-frame window, 1.0 px, savgol and a key-value refit -- worth +0.0035 soft IoU and +0.027 key
 F1 over these defaults, for no retraining.
 
-The defaults below stay at v1's values deliberately, so that re-running any v1 number
-reproduces it. The better operating point is a flag, not a silent change.
+**v2 moved off v1's defaults at Step 2c**, measured on the S0 anchor over both seeds
+(`steps/step2c-faq.md`). v1's 1.0 px / boxcar / no-refit spent 0.34x the artist's key count --
+three times too few -- and scored 0.9478 on-screen soft IoU with a worst element of 0.660.
+0.2 px / savgol / no-refit spends 1.12x and scores 0.9717 with a worst element of 0.864, for
+no retraining. The key economy moves from failing the [0.75, 1.3]x band to inside it.
+
+Two things this is **not**. It is not a key-timing improvement worth 0.33 F1: at 3.3x the keys
+the same-count random baseline rose from 0.368 to 0.681, so only +0.021 of the +0.335 is
+timing (see ``key_f1_over_random``). And it is not free -- the train-to-held-frame gap widens
+from +0.0027 to +0.0089, because a tighter tolerance tracks the training track's own noise.
+That trade was taken because every gate except the gap gate improves and the gap gate
+(<= 0.002) is missed at every operating point measured, v1's included.
+
+Changing this does not disturb any v1 number: v1 reads ``roto.model.reconstruct``, which keeps
+its own defaults. The refit flag stays off -- it buys another +0.005 on trained frames and
+loses 0.010 on held ones, which is fitting the keys to the noise.
 """
 
 SMOOTH_WINDOW = 9
@@ -113,13 +167,20 @@ class RebuildConfig:
     """
     tol_px: float = DEFAULT_TOL_PX
     smooth: int = SMOOTH_WINDOW
-    smooth_kind: str = BOXCAR
-    """``'boxcar'`` reproduces v1; ``'savgol'`` preserves the motion peaks artists key."""
+    smooth_kind: str = SAVGOL
+    """``'savgol'`` preserves the motion peaks artists key; ``'boxcar'`` reproduces v1.
+
+    The single biggest term in the Step 2c result. A boxcar flattens the turnarounds a DP
+    picker is looking for, so at any tolerance it both keys less and times worse: at 0.2 px,
+    boxcar reads 0.73x keys and 0.635 F1 against savgol's 1.12x and 0.753."""
     refit_values: bool = False
     """Fit key values to the raw track once the key frames are chosen. See ``keys.refit``.
 
-    Off by default so v1's behaviour is reproducible; the sweep decides whether it earns its
-    place, and it is a strictly cheaper change than swapping the filter."""
+    **Measured at Step 2c and deliberately left off.** It is the one axis where the two
+    governing documents disagree: it wins on charter L4's ranking metric (frames below 0.90:
+    49 -> 28) and loses on plan section 4's generalisation check (held-frame gap +0.0089 ->
+    +0.0260, nearly ten times the v1 default's). The gap is the harder number to argue with,
+    because a key value fitted to the raw track is fitted to that track's noise. Off."""
     predicted_affine: bool = False
     """Score the *transform head's* output instead of the artist's track. See ``affine_doc``."""
     motion: str = ARTIST
@@ -150,6 +211,31 @@ class RebuildConfig:
     loosening is what lets the pair move keys without moving the key count, and the key count
     has to stay inside an editable economy. ``0`` is the one-sided form. See
     ``keys.dp.local_tolerances``."""
+    lifespan: str = ARTIST
+    """``'artist'`` teacher-forces which frames each shape is on screen for, as S0 and S1 both
+    do. ``'predicted'`` is charter S4 stage **S2**: the lifespan head's own answer decides,
+    through :func:`alive_mask`, and the rebuilt document carries it as a real opacity track so
+    the renderer draws exactly what was predicted.
+
+    This is the switch the S2 render gate is about. It changes two things at once and both are
+    intended: the keyframe search runs over the *predicted* span, and the render draws the
+    *predicted* shapes."""
+    alive_on: float = 0.5
+    alive_off: float = 0.2
+    alive_min_gap: int = 0
+    """The hysteresis. See :func:`alive_mask` for why ``alive_off`` sits below ``alive_on``
+    rather than equal to it, and why there is no ``min_run`` to match ``alive_min_gap``.
+    Swept on held-out frames only."""
+    point_count: str = ARTIST
+    """``'artist'`` uses each shape's real control-point count; ``'predicted'`` reads the
+    point-count head's argmax.
+
+    **Reported, never gated** -- see ``v2-s2-design-note.md`` section 2.4. One hazard the
+    render prices rather than prevents: the point head's slots beyond a shape's real count were
+    never supervised, because the point term is masked by ``point_mask``. So a predicted count
+    *above* the artist's appends control points the model was never taught to place. The count
+    is clamped into ``[3, Pmax]`` and the mismatch rate is reported in both directions, so if
+    this fires often it is visible rather than silent."""
     key_thresh: float = 0.5
     """Threshold at which the head's *own* key set is read off, for reporting only.
 
@@ -160,7 +246,7 @@ class RebuildConfig:
 
 @dataclass(slots=True)
 class Reconstruction:
-    layer_id: str
+    element_id: str
     doc: RotoDoc
     frames: np.ndarray
     soft_iou: np.ndarray
@@ -229,6 +315,45 @@ class Reconstruction:
     key_tol_min: float = 0.0
     key_tol_max: float = 0.0
     """The range of local tolerance the DP actually ran at, over every shape in the layer."""
+    lifespan_cells: int = 0
+    lifespan_accuracy: float = 0.0
+    lifespan_fp_rate: float = 0.0
+    lifespan_fn_rate: float = 0.0
+    """The lifespan head's two error rates, over every ``(frame, shape)`` cell, **split**.
+
+    Never collapsed into the accuracy above, because they do not cost the same: at 1% of cells
+    an omission is worth 0.0215 soft IoU and an intrusion 0.0067 -- 3.2x -- and at 10% the
+    ratio is 7.3x. Two heads at the same accuracy can therefore sit either side of the render
+    gate, and only these two columns say which is which. Zero for a reconstruction built on
+    the artist's lifespans."""
+    lifespan_live_rate_pred: float = 0.0
+    lifespan_live_rate_artist: float = 0.0
+    lifespan_transitions_pred: int = 0
+    lifespan_transitions_artist: int = 0
+    """On/off transitions, predicted against the artist's.
+
+    The economy column for lifespans, and it reads like the key-economy one: a head that
+    flickers produces far more transitions than the artist and can still score well on cell
+    accuracy, exactly as a picker that over-keys can score well on key F1."""
+    point_count_exact: float | None = None
+    point_count_over: int = 0
+    point_count_under: int = 0
+    """How often the point-count head's argmax matched, and which way it missed.
+
+    ``None`` -- not 0.0 -- when the counts were teacher-forced, because a run that did not use
+    the head and a head that got every count wrong are opposite results and a shared default
+    would print them the same way. ``lifespan_cells`` carries the same signal for the other
+    head, where 0 cells is already unambiguous.
+
+    **Reported, never gated** -- design note section 2.4. Split by direction because only one
+    of them is dangerous: a count *above* the artist's reads point-head slots the point term
+    never supervised, so ``point_count_over`` is the column that says whether that hazard is
+    theoretical or live."""
+    alive_pred: np.ndarray | None = None
+    """``(F, S)`` the lifespan mask the decode actually used, or ``None`` when teacher-forced.
+
+    Kept off :meth:`summary` deliberately -- it is per cell and a summary is a JSON row. It
+    exists so the scorer can split lifespan accuracy by the dataset's own frame holdout."""
     jitter_px: float = 0.0
     """Mean frame-to-frame change in the *error* of the predicted track, in crop pixels.
 
@@ -241,8 +366,12 @@ class Reconstruction:
         # shot, so how many there are is the operational question, and a single min cannot
         # distinguish one outlier from a bad third of the track.
         return {
-            'layer_id': self.layer_id,
+            'element_id': self.element_id,
             'frames': int(len(self.frames)),
+            # Shapes, so a per-shape statistic (the point count) can be weighted by shapes
+            # rather than by frames. A 247-shape element and a 1-shape one of the same length
+            # are not equal evidence about point counts.
+            'shapes': sum(1 for _ in self.doc.shapes()),
             'mean_soft_iou': float(self.soft_iou.mean()),
             'min_soft_iou': float(self.soft_iou.min()),
             'p05_soft_iou': float(np.percentile(self.soft_iou, 5)),
@@ -261,6 +390,17 @@ class Reconstruction:
             'key_f1': self.key_f1,
             'key_f1_strict': self.key_f1_strict,
             'shapes_with_no_in_range_key': self.shapes_with_no_in_range_key,
+            'lifespan_cells': self.lifespan_cells,
+            'lifespan_accuracy': self.lifespan_accuracy,
+            'lifespan_fp_rate': self.lifespan_fp_rate,
+            'lifespan_fn_rate': self.lifespan_fn_rate,
+            'lifespan_live_rate_pred': self.lifespan_live_rate_pred,
+            'lifespan_live_rate_artist': self.lifespan_live_rate_artist,
+            'lifespan_transitions_pred': self.lifespan_transitions_pred,
+            'lifespan_transitions_artist': self.lifespan_transitions_artist,
+            'point_count_exact': self.point_count_exact,
+            'point_count_over': self.point_count_over,
+            'point_count_under': self.point_count_under,
             'baseline_pipeline_key_f1_random': self.baseline_pipeline_key_f1_random,
             'key_f1_over_random': self.key_f1_over_random,
             'head_key_precision': self.head_key_precision,
@@ -276,23 +416,23 @@ class Reconstruction:
 
 
 def load_model(checkpoint: str | Path,
-               device: str | torch.device | None = None) -> tuple[RotoNet, dict[str, Any]]:
+               device: str | torch.device | None = None) -> tuple[RotoNetV2, dict[str, Any]]:
     """Load a checkpoint onto ``device`` (GPU when one exists).
 
     ``arch`` carries ``in_frames`` and ``self_attn`` from v1.1 on; both default off in
-    ``RotoNet``, so a v1 checkpoint written before they existed still loads unchanged.
+    ``RotoNetV2``, so a v1 checkpoint written before they existed still loads unchanged.
     """
     ck = torch.load(checkpoint, map_location='cpu', weights_only=False)
     dev = torch.device(device) if device is not None else \
         torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    net = RotoNet(**ck['arch'])
+    net = RotoNetV2(**ck['arch'])
     net.load_state_dict(ck['state_dict'])
     net.eval()
     return net.to(dev), ck
 
 
 @torch.no_grad()
-def untrained_queries(net: RotoNet, el: LayerData, seed: int = 0) -> tuple[int, int]:
+def untrained_queries(net: RotoNetV2, el: ElementData, seed: int = 0) -> tuple[int, int]:
     """Give a layer the checkpoint never saw its own **freshly initialised** query rows.
 
     Shape queries are per ``(layer, shape)``, so a layer withheld from training has no rows in
@@ -306,7 +446,7 @@ def untrained_queries(net: RotoNet, el: LayerData, seed: int = 0) -> tuple[int, 
       what this does. Then the number means something specific and useful: **what the encoder
       alone produces**, with the memorisation capacity set to zero.
 
-    That second reading is the one v2 needs. ``net.RotoNet`` has said since v1 that the query
+    That second reading is the one v2 needs. ``net.RotoNetV2`` has said since v1 that the query
     table is memorisation capacity, that the v1 number therefore does not transfer, and that
     v2 must replace these embeddings with queries the encoder produces -- "and the gap between
     the two is the honest measure of what the encoder still has to learn". This function is
@@ -334,10 +474,42 @@ def untrained_queries(net: RotoNet, el: LayerData, seed: int = 0) -> tuple[int, 
     return out[0], out[1]
 
 
+class Predicted(NamedTuple):
+    """One element's worth of network output, in numpy. Mirrors :class:`net.Prediction`.
+
+    Named rather than positional for the same reason: charter S4 adds a head per stage, and a
+    tuple that grows by one every round turns every call site into a silent renumbering.
+    """
+    points: np.ndarray
+    """``(F, S, Pmax, Cmax, 2)`` in crop space."""
+    affine: np.ndarray
+    """``(F, G, dof)`` -- 6 wide for a document-space head, 8 for the crop-space projective."""
+    key_prob: np.ndarray | None
+    """``(F, S)`` key-timing probability, or ``None`` for a checkpoint with no key head."""
+    alive_prob: np.ndarray | None = None
+    """``(F, S)`` lifespan probability, or ``None`` without an alive head."""
+    slots_alive: int | None = None
+    """How many shared slots the model put on screen at any frame -- its **invented shape
+    count**, and ``None`` for a per-element query table where the count was given.
+
+    Counted over *every* slot, including those past the element's real shape count, because
+    that is the number charter S4's S3 style constraint reads: a model that clears the render
+    gate with 1.2 shapes has found the hole the traced-silhouette baseline found, not done the
+    task."""
+    count: np.ndarray | None = None
+    """``(S,)`` point count, argmax over the head's classes and **averaged over frames first**.
+
+    The count cannot vary with the frame -- ``ir.Shape.validate`` rejects a shape whose point
+    count changes across its keys -- but the head is evaluated per frame and nothing forces its
+    logits to agree frame to frame. Averaging the logits over the track before the argmax uses
+    every frame's evidence and cannot produce an inconsistent answer, where a per-frame argmax
+    plus a vote could."""
+
+
 @torch.no_grad()
-def predict(net: RotoNet, el: LayerData, shape_base: int = 0, group_base: int = 0,
-            batch: int = 8) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-    """``(points (F,S,Pmax,Cmax,2) in crop space, affine (F,G,dof), key prob (F,S) or None)``.
+def predict(net: RotoNetV2, el: ElementData, shape_base: int = 0, group_base: int = 0,
+            batch: int = 8) -> Predicted:
+    """Everything the network says about one element. See :class:`Predicted`.
 
     ``shape_base``/``group_base`` are the layer's offsets into the query tables and must
     match training exactly; they come from the checkpoint.
@@ -345,49 +517,87 @@ def predict(net: RotoNet, el: LayerData, shape_base: int = 0, group_base: int = 
     The temporal window is read from the network, not passed in: a model trained on 3
     stacked frames must be *given* 3 stacked frames, and getting that wrong would show up as
     a mysterious quality loss at inference rather than as an error. Window *alignment* travels
-    the same way and for the same reason -- see ``net.RotoNet``.
+    the same way and for the same reason -- see ``net.RotoNetV2``.
 
-    The second return is ``(F, G, affine_dim)``, 6 wide for a v1-style document-space head and
-    8 for v1.1's crop-space projective one. ``affine_doc`` reads the width to know which it is
-    holding.
+    ``affine`` is 6 wide for a v1-style document-space head and 8 for v1.1's crop-space
+    projective one. ``affine_doc`` reads the width to know which it is holding.
 
-    The third is the key-timing head's probability per (frame, shape), or ``None`` for a
-    checkpoint without one -- which is every checkpoint before v1.3, and the reason the flag
-    is read off the network rather than passed in: a caller that asked for key biasing from a
-    model that has no key head would otherwise get a silent uniform bias instead of an error.
+    Every head's flag is read **off the network** rather than passed in. A caller that asked
+    for key biasing, or a predicted lifespan, from a model that has no such head would
+    otherwise get a silent uniform answer instead of an error -- and a uniform lifespan is
+    "always alive", which is a trivial baseline scoring 0.0971 below the truth and would read
+    as a model result.
+
+    ``desc`` is sliced to the width the network was *trained* with, for the same reason the
+    window is: a model trained without ``n_points`` in its query must not be handed one at
+    inference. See ``traindata.query_desc``.
     """
     out = np.zeros_like(el.points)
     dof = getattr(net, 'affine_dim', 6)
     aff = np.zeros(el.affine.shape[:2] + (dof,), np.float32)
-    has_key = bool(getattr(net, 'key_head', False))
-    keyp = np.zeros((len(el.frames), el.n_shapes), np.float32) if has_key else None
+    F, S = len(el.frames), el.n_shapes
+    # S3: a shared slot bank, addressed by the canonical order rather than by identity. The
+    # network is asked for every slot; the first ``S`` in canonical order are this element's
+    # shapes and are scattered back into document order, so everything downstream -- rebuild,
+    # the renderer, every metric -- keeps working in the order the artist's file uses.
+    slots = getattr(net, 'query_mode', 'table') == 'slots'
+    n_q = int(net.shape_bank.num_embeddings) if slots else S
+    perm = canonical_order(el) if slots else None
+    keyp = np.zeros((F, S), np.float32) if getattr(net, 'key_head', False) else None
+    alivep = np.zeros((F, S), np.float32) if getattr(net, 'alive_head', False) else None
+    extra = np.zeros((F, n_q), np.float32) if (slots and alivep is not None) else None
+    clog = None
     P, C = el.points.shape[2], el.points.shape[3]
     dev = next(net.parameters()).device
-    shape_ids = (torch.arange(el.n_shapes) + shape_base)[None].to(dev)
+    shape_ids = (torch.arange(n_q) + (0 if slots else shape_base))[None].to(dev)
     group_ids = (torch.arange(el.n_groups) + group_base)[None].to(dev)
-    desc = torch.from_numpy(el.desc)[None].to(dev)
+    desc = torch.from_numpy(query_desc(el, getattr(net, 'desc_dim', 3) == 3))[None].to(dev)
     in_frames = getattr(net, 'in_frames', 1)
     align = bool(getattr(net, 'align_window', False))
-    for i in range(0, len(el.frames), batch):
-        idx = np.arange(i, min(i + batch, len(el.frames)))
+    for i in range(0, F, batch):
+        idx = np.arange(i, min(i + batch, F))
         a = torch.from_numpy(el.window(idx, in_frames, align)).to(dev)
         n = a.shape[0]
-        pts, af, klog = net(a, shape_ids.expand(n, -1), group_ids.expand(n, -1),
-                            desc.expand(n, -1, -1))
-        out[idx] = pts[:, :, :P, :C].cpu().numpy()
-        aff[idx] = af[:, :el.n_groups].cpu().numpy()
-        if keyp is not None and klog is not None:
-            keyp[idx] = torch.sigmoid(klog[:, :el.n_shapes]).cpu().numpy()
-    return out, aff, keyp
+        p = net(a, shape_ids.expand(n, -1), group_ids.expand(n, -1), desc.expand(n, -1, -1))
+        # One scatter helper for every per-shape output: with a query table the slot order
+        # *is* document order, and with shared slots it is the canonical order, so the only
+        # difference is where the row lands.
+        def put(dest, values):
+            if perm is None:
+                dest[idx] = values
+            else:
+                dest[np.ix_(idx, perm)] = values
+
+        put(out, p.points[:, :S, :P, :C].cpu().numpy())
+        aff[idx] = p.affine[:, :el.n_groups].cpu().numpy()
+        if keyp is not None and p.key is not None:
+            put(keyp, torch.sigmoid(p.key[:, :S]).cpu().numpy())
+        if alivep is not None and p.alive is not None:
+            al = torch.sigmoid(p.alive).cpu().numpy()
+            if extra is not None:
+                extra[idx] = al
+            put(alivep, al[:, :S])
+        if p.count is not None:
+            # Summed over the whole track before the argmax: the count cannot vary with the
+            # frame, so every frame is evidence for one answer. See ``Predicted.count``.
+            c = p.count[:, :S].sum(0).cpu().numpy()
+            clog = c if clog is None else clog + c
+    count = clog.argmax(-1).astype(np.int32) if clog is not None else None
+    if count is not None and perm is not None:
+        doc = np.zeros_like(count)
+        doc[perm] = count
+        count = doc
+    n_alive = int((extra > 0.5).any(axis=0).sum()) if extra is not None else None
+    return Predicted(out, aff, keyp, alivep, n_alive, count)
 
 
-def predict_crop_points(net: RotoNet, el: LayerData, shape_base: int = 0,
+def predict_crop_points(net: RotoNetV2, el: ElementData, shape_base: int = 0,
                         group_base: int = 0, batch: int = 8) -> np.ndarray:
     """Points only -- the common case. See :func:`predict`."""
-    return predict(net, el, shape_base, group_base, batch)[0]
+    return predict(net, el, shape_base, group_base, batch).points
 
 
-def to_local(el: LayerData, crop_pts: np.ndarray,
+def to_local(el: ElementData, crop_pts: np.ndarray,
              matrices: np.ndarray | None = None) -> np.ndarray:
     """Crop-space predictions -> IR-native local normalised coordinates.
 
@@ -423,7 +633,7 @@ def track_jitter(crop_pts: np.ndarray, target: np.ndarray, live: np.ndarray,
     return float(d[m].mean()) if m.any() else 0.0
 
 
-def transform_matrices(el: LayerData, pred_affine: np.ndarray) -> np.ndarray:
+def transform_matrices(el: ElementData, pred_affine: np.ndarray) -> np.ndarray:
     """``(F, G, 4, 4)`` document-space layer matrices from whatever the head predicted.
 
     The width says which representation is in hand, so one call site serves both and a
@@ -443,7 +653,7 @@ def transform_matrices(el: LayerData, pred_affine: np.ndarray) -> np.ndarray:
     return matrix_from_affine(pred_affine)
 
 
-def with_transforms(doc: RotoDoc, el: LayerData, mats: np.ndarray) -> RotoDoc:
+def with_transforms(doc: RotoDoc, el: ElementData, mats: np.ndarray) -> RotoDoc:
     """Put ``mats`` ``(F, G, 4, 4)`` on every shape's transform carrier, in place.
 
     One function for both consumers -- :func:`affine_doc` and ``motion='predicted'`` -- so
@@ -472,14 +682,14 @@ def with_transforms(doc: RotoDoc, el: LayerData, mats: np.ndarray) -> RotoDoc:
         g = int(el.group_of[si])
         carriers = [l for l in ancestors if l.transform] or [ancestors[-1]]
         assert len(carriers) == 1, \
-            f'{el.layer_id}: shape {si} has {len(carriers)} transformed ancestors; ' \
+            f'{el.element_id}: shape {si} has {len(carriers)} transformed ancestors; ' \
             'replacing both would apply the group matrix twice'
         carriers[0].transform = [Key(int(f), 'linear', mats[fi, g])
                                  for fi, f in enumerate(el.frames)]
     return doc
 
 
-def predicted_shape_matrices(el: LayerData, pred_affine: np.ndarray) -> np.ndarray:
+def predicted_shape_matrices(el: ElementData, pred_affine: np.ndarray) -> np.ndarray:
     """``(F, S, 4, 4)`` -- the predicted track fanned out per shape, as ``el.matrices`` is.
 
     ``to_local`` inverts a per-shape matrix; the head predicts per *group*. Groups are exactly
@@ -488,7 +698,7 @@ def predicted_shape_matrices(el: LayerData, pred_affine: np.ndarray) -> np.ndarr
     return transform_matrices(el, pred_affine)[:, el.group_of]
 
 
-def affine_doc(el: LayerData, pred_affine: np.ndarray) -> RotoDoc:
+def affine_doc(el: ElementData, pred_affine: np.ndarray) -> RotoDoc:
     """The artist's own shapes, moved by the *predicted* transform track.
 
     This is how the transform head gets a number on the table. It is trained but v1 never
@@ -508,8 +718,36 @@ def affine_doc(el: LayerData, pred_affine: np.ndarray) -> RotoDoc:
     return with_transforms(doc, el, transform_matrices(el, pred_affine))
 
 
-def rebuild(el: LayerData, local_pts: np.ndarray, cfg: RebuildConfig | None = None,
-            key_prob: np.ndarray | None = None) -> tuple[RotoDoc, dict[str, Any]]:
+def lifespan_stats(pred: np.ndarray, truth: np.ndarray) -> dict[str, Any]:
+    """How a predicted ``(F, S)`` lifespan mask compares to the artist's.
+
+    Six numbers, and the split into false positives and false negatives is the point: they cost
+    **1 : 3.2** at the render (design note section 2.3), so one accuracy figure hides the
+    difference between a head that is safe and a head that is expensive. Boundary error is
+    reported separately again, because it is the mistake a *working* head makes and the one the
+    render gate is tightest against -- every boundary out by a frame is 0.0102 late, 0.0374
+    early, against a 0.01 budget.
+    """
+    cells = int(truth.size)
+    fp = int((pred & ~truth).sum())
+    fn = int((~pred & truth).sum())
+    edges_true = int((truth[1:] != truth[:-1]).sum())
+    edges_pred = int((pred[1:] != pred[:-1]).sum())
+    return {
+        'lifespan_cells': cells,
+        'lifespan_accuracy': (cells - fp - fn) / cells if cells else 0.0,
+        'lifespan_fp_rate': fp / cells if cells else 0.0,
+        'lifespan_fn_rate': fn / cells if cells else 0.0,
+        'lifespan_live_rate_pred': float(pred.mean()) if cells else 0.0,
+        'lifespan_live_rate_artist': float(truth.mean()) if cells else 0.0,
+        'lifespan_transitions_pred': edges_pred,
+        'lifespan_transitions_artist': edges_true,
+    }
+
+
+def rebuild(el: ElementData, local_pts: np.ndarray, cfg: RebuildConfig | None = None,
+            key_prob: np.ndarray | None = None, alive_prob: np.ndarray | None = None,
+            point_count: np.ndarray | None = None) -> tuple[RotoDoc, dict[str, Any]]:
     """Choose keys per shape and write a document carrying only those keys.
 
     The keyframe search runs on the point positions only, not on Bezier handles. Handles are
@@ -532,11 +770,28 @@ def rebuild(el: LayerData, local_pts: np.ndarray, cfg: RebuildConfig | None = No
     are reported side by side -- see ``Reconstruction.head_key_f1``.
     """
     cfg = cfg or RebuildConfig()
+    for name, v in (('lifespan', cfg.lifespan), ('point_count', cfg.point_count)):
+        if v not in STRUCTURE_SOURCES:
+            raise ValueError(f'unknown {name} {v!r}, want one of {STRUCTURE_SOURCES}')
+    if cfg.lifespan == PREDICTED and alive_prob is None:
+        raise ValueError("lifespan='predicted' needs the alive head's probabilities; this "
+                         'checkpoint has no lifespan head, and defaulting to the artist\'s '
+                         'track would silently report a teacher-forced number as a predicted '
+                         'one')
+    if cfg.point_count == PREDICTED and point_count is None:
+        raise ValueError("point_count='predicted' needs the point-count head; this checkpoint "
+                         'has none')
     doc = from_json_ir(json.loads((el.directory / 'target_ir.json').read_text()))
     truth_doc = from_json_ir(json.loads((el.directory / 'target_ir.json').read_text()))
     shapes = [s for _, s in doc.shapes()]
     truth_shapes = [s for _, s in truth_doc.shapes()]
     at = {int(f): i for i, f in enumerate(el.frames)}
+
+    # The span the keyframe search runs over, and the shapes the render will draw. The
+    # artist's `el.live` when the lifespan is teacher-forced, the head's own answer at S2.
+    span_live = (alive_mask(alive_prob, cfg.alive_on, cfg.alive_off, cfg.alive_min_gap)
+                 if cfg.lifespan == PREDICTED else el.live)
+    Pmax = local_pts.shape[2]
 
     n_pred = n_true = 0
     precs, recs, f1s, weights = [], [], [], []
@@ -548,17 +803,42 @@ def rebuild(el: LayerData, local_pts: np.ndarray, cfg: RebuildConfig | None = No
     tol_lo, tol_hi = float('inf'), 0.0
     # Seeded: the random baseline is a number a report quotes, so it has to be reproducible.
     rng = np.random.default_rng(0)
+    n_count_over = n_count_under = 0
     for si, (shape, tshape) in enumerate(zip(shapes, truth_shapes)):
-        live = np.array([int(f) for f in el.frames if el.live[at[int(f)], si]], np.int32)
+        # `live` is the span the DP runs on and the render draws; `artist_live` is the
+        # artist's, and every key metric below reads that one. Design note deviation 4.4:
+        # if the key columns silently moved to the predicted span, the S0 -> S1 -> S2
+        # comparison would break and a lifespan regression would read as a key-timing result.
+        live = np.array([int(f) for f in el.frames if span_live[at[int(f)], si]], np.int32)
+        artist_live = np.array([int(f) for f in el.frames if el.live[at[int(f)], si]], np.int32)
         P = shape.n_points
+        if cfg.point_count == PREDICTED:
+            # Clamped into what the point head actually emitted and what a curve needs. A
+            # predicted count *above* the artist's reads slots the point term never
+            # supervised -- see RebuildConfig.point_count; counted here so it is visible.
+            want = int(np.clip(int(point_count[si]), 3, Pmax))
+            n_count_over += want > P
+            n_count_under += want < P
+            P = want
         C = int(np.asarray(shape.path[0].value).shape[1])
         interp = {k.frame: k.interp for k in tshape.path}
 
         def value(frame: int) -> np.ndarray:
             return local_pts[at[int(frame)], si, :P, :C].astype(np.float64)
 
+        if cfg.lifespan == PREDICTED:
+            # The predicted lifespan has to travel on the document, or the renderer draws the
+            # artist's. Written as a hold-interpolated opacity track, which is what the IR
+            # already uses for a lifespan, so nothing downstream is a special case.
+            shape.opacity = [Key(int(f), 'hold',
+                                 np.array([[100.0 if span_live[at[int(f)], si] else 0.0]]))
+                             for f in el.frames]
+
         if len(live) < 2:
-            # Nothing to interpolate: one key at the frame the shape exists on.
+            # Nothing to interpolate: one key at the frame the shape exists on. With a
+            # predicted lifespan this also covers a shape the head switched off everywhere --
+            # the opacity track above already makes it draw nothing, so the path key is only
+            # there to keep the shape well formed.
             f = int(live[0]) if len(live) else int(el.frames[0])
             shape.path = [Key(f, interp.get(f, 'linear'), value(f))]
             n_pred += 1
@@ -584,7 +864,16 @@ def rebuild(el: LayerData, local_pts: np.ndarray, cfg: RebuildConfig | None = No
             vals = np.stack([clean[pick[int(f)]] for f in sel.frames])
         shape.path = [Key(int(f), modes[i], vals[i]) for i, f in enumerate(sel.frames)]
 
-        truth = np.array(sorted({int(np.clip(k.frame, live[0], live[-1]))
+        # Every key metric from here down reads `artist_live`, never the DP's span. When the
+        # lifespan is teacher-forced the two are the same array and nothing changes; when it
+        # is predicted, this is what keeps the S0 -> S1 -> S2 key columns comparable instead
+        # of letting a lifespan regression surface as a key-timing result (deviation 4.4).
+        # A shape the artist never has on screen has no key truth to compare against, so it
+        # sits out of the key means rather than scoring zero for an impossible task -- the
+        # same rule `strict` already applies one line down.
+        if not len(artist_live):
+            continue
+        truth = np.array(sorted({int(np.clip(k.frame, artist_live[0], artist_live[-1]))
                                  for k in tshape.path}), np.int32)
         # The same comparison with the out-of-live-range keys *excluded* rather than clipped
         # onto the boundary. 7.91% of this archive's 24,335 artist keys sit outside their
@@ -595,7 +884,7 @@ def rebuild(el: LayerData, local_pts: np.ndarray, cfg: RebuildConfig | None = No
         # v1.1 and v1.2 used it and the plan's >= 0.42 gate was set against one of them;
         # `key_f1_strict` is the version with the free credit removed. Both are reported.
         strict = np.array(sorted({int(k.frame) for k in tshape.path
-                                  if live[0] <= k.frame <= live[-1]}), np.int32)
+                                  if artist_live[0] <= k.frame <= artist_live[-1]}), np.int32)
         if len(strict):
             sp, sr, ss = key_f1(sel.frames, strict, tolerance=1)
             strict_f1s.append(ss); strict_w.append(len(strict))
@@ -611,8 +900,8 @@ def rebuild(el: LayerData, local_pts: np.ndarray, cfg: RebuildConfig | None = No
         # carry 40% of the archive's keys. So: what would the same number of keys, placed at
         # random over the same live frames, have scored? Anything the DP earns is the
         # difference. Seeded, because a report quotes it.
-        pick = rng.permutation(len(live))[:len(sel.frames)]
-        rand_f1s.append(key_f1(np.sort(live[np.sort(pick)]), truth, tolerance=1)[2])
+        pick = rng.permutation(len(artist_live))[:len(sel.frames)]
+        rand_f1s.append(key_f1(np.sort(artist_live[np.sort(pick)]), truth, tolerance=1)[2])
         n_pred += len(sel.frames)
         n_true += len(truth)
         if key_prob is not None:
@@ -628,10 +917,11 @@ def rebuild(el: LayerData, local_pts: np.ndarray, cfg: RebuildConfig | None = No
             # scores well: measured on the 12k probe, `Layer_52` read 0.803 against 0.797 for
             # firing on every live frame. A head metric that can be matched by "fire on
             # everything" is not measuring the head.
-            allf1s.append(key_f1(np.asarray(live, np.int32), truth, tolerance=1)[2])
+            allf1s.append(key_f1(np.asarray(artist_live, np.int32), truth, tolerance=1)[2])
             n_fire = int((pr > cfg.key_thresh).sum())
-            shuffled = rng.permutation(len(live))[:n_fire]
-            rnd = np.sort(live[np.sort(shuffled)]) if n_fire else np.zeros(0, np.int32)
+            shuffled = rng.permutation(len(artist_live))[:n_fire]
+            rnd = (np.sort(artist_live[np.sort(shuffled)]) if n_fire
+                   else np.zeros(0, np.int32))
             randf1s.append(key_f1(np.asarray(rnd, np.int32), truth, tolerance=1)[2])
 
     w = np.array(weights, float)
@@ -644,6 +934,21 @@ def rebuild(el: LayerData, local_pts: np.ndarray, cfg: RebuildConfig | None = No
         'key_tol_min': 0.0 if tol_lo == float('inf') else float(tol_lo),
         'key_tol_max': float(tol_hi),
     }
+    if cfg.lifespan == PREDICTED:
+        stats.update(lifespan_stats(span_live, el.live))
+        # The mask itself, so a caller holding the dataset's frame split can ask the question
+        # the aggregate cannot: did the head *learn* lifespans, or memorise these frames? The
+        # query row is constant across frames, so anything frame-varying must come through the
+        # alpha -- but "this exact picture means shape 7 is off" is still memorisation, and on
+        # a dataset where 61% of lifespan boundaries are invisible (exp_s2_visibility) it is
+        # the leading hypothesis for a high training-set accuracy. Not in ``summary()``: it is
+        # (F, S) and summaries go to JSON.
+        stats['alive_pred'] = span_live
+    if cfg.point_count == PREDICTED:
+        n_sh = len(shapes)
+        stats.update(point_count_exact=(n_sh - n_count_over - n_count_under) / max(1, n_sh),
+                     point_count_over=int(n_count_over),
+                     point_count_under=int(n_count_under))
     if len(rand_f1s) == len(w) and len(w):
         stats['baseline_pipeline_key_f1_random'] = float(np.dot(w, rand_f1s))
         stats['key_f1_over_random'] = stats['key_f1'] - stats['baseline_pipeline_key_f1_random']
@@ -664,7 +969,7 @@ def rebuild(el: LayerData, local_pts: np.ndarray, cfg: RebuildConfig | None = No
     return doc, stats
 
 
-def score_doc(el: LayerData, doc: RotoDoc, want: Sequence[int],
+def score_doc(el: ElementData, doc: RotoDoc, want: Sequence[int],
               supersample: int | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Render ``doc`` on ``want`` and compare to the stored alpha. Returns (soft, hard).
 
@@ -691,9 +996,10 @@ def score_doc(el: LayerData, doc: RotoDoc, want: Sequence[int],
     return np.asarray(softs), np.asarray(hards)
 
 
-def assemble(el: LayerData, crop_pts: np.ndarray, pred_affine: np.ndarray,
+def assemble(el: ElementData, crop_pts: np.ndarray, pred_affine: np.ndarray,
              cfg: RebuildConfig | None = None, frames: Sequence[int] | None = None,
-             key_prob: np.ndarray | None = None) -> Reconstruction:
+             key_prob: np.ndarray | None = None, alive_prob: np.ndarray | None = None,
+             point_count: np.ndarray | None = None) -> Reconstruction:
     """Predictions -> keys -> a document -> pixels -> numbers. The scoring half of
     :func:`reconstruct`, split out so it can be driven by arrays instead of a network.
 
@@ -722,7 +1028,8 @@ def assemble(el: LayerData, crop_pts: np.ndarray, pred_affine: np.ndarray,
     # The keys are chosen on the local track, so which matrix is inverted here is part of
     # the de-teacher-forcing rather than a detail of it -- see the module docstring.
     mats = predicted_shape_matrices(el, pred_affine) if cfg.motion == PREDICTED else None
-    doc, kstats = rebuild(el, to_local(el, crop_pts, mats), cfg, key_prob)
+    doc, kstats = rebuild(el, to_local(el, crop_pts, mats), cfg, key_prob,
+                          alive_prob, point_count)
     if cfg.motion == PREDICTED:
         doc = with_transforms(doc, el, transform_matrices(el, pred_affine))
     if cfg.predicted_affine:
@@ -730,14 +1037,14 @@ def assemble(el: LayerData, crop_pts: np.ndarray, pred_affine: np.ndarray,
 
     want = list(frames) if frames is not None else [int(f) for f in el.frames]
     softs, hards = score_doc(el, doc, want, cfg.supersample)
-    return Reconstruction(el.layer_id, doc, np.asarray(want), softs, hards,
+    return Reconstruction(el.element_id, doc, np.asarray(want), softs, hards,
                           point_err, point_err_p95_px=p95, point_err_max_px=pmax,
                           jitter_px=jitter, **kstats)
 
 
-def reconstruct(layer_dir: str | Path, net: RotoNet, cfg: RebuildConfig | None = None,
+def reconstruct(element_dir: str | Path, net: RotoNetV2, cfg: RebuildConfig | None = None,
                 frames: Sequence[int] | None = None, shape_base: int = 0,
                 group_base: int = 0) -> Reconstruction:
-    el = load_element(layer_dir)
-    crop_pts, pred_aff, key_prob = predict(net, el, shape_base, group_base)
-    return assemble(el, crop_pts, pred_aff, cfg, frames, key_prob)
+    el = load_element(element_dir)
+    p = predict(net, el, shape_base, group_base)
+    return assemble(el, p.points, p.affine, cfg, frames, p.key_prob, p.alive_prob, p.count)

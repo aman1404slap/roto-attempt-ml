@@ -15,7 +15,7 @@ from roto.ir import CATMULLROM, LINEAR, Key, Layer, RotoDoc, Shape, sample
 from roto.keys.refit import basis_matrix, refit_key_values
 from roto.model.curveloss import PolylineMaps, curve_loss, polyline_matrix
 from roto.model.data import group_probes, shift_alpha
-from roto.model.geometry import crop_matrix, local_to_crop
+from roto.geometry import crop_matrix, local_to_crop
 from roto.model.net import RotoNet
 from roto.model.smoothing import smooth_track
 from roto.model.train import (TrainConfig, affine_probe_term, affine_temporal_term,

@@ -40,7 +40,7 @@ from roto.keys import f1 as key_f1                                       # noqa:
 from roto.metrics import soft_iou                                        # noqa: E402
 from roto.model.curveloss import polyline_matrix                         # noqa: E402
 from roto.model.data import load_element                                 # noqa: E402
-from roto.model.geometry import crop_matrix, crop_to_local, local_to_crop  # noqa: E402
+from roto.geometry import crop_matrix, crop_to_local, local_to_crop  # noqa: E402
 from roto.model.reconstruct import RebuildConfig, assemble               # noqa: E402
 from roto.model.report import spread                                     # noqa: E402
 from roto.model.train import apply_proj                                  # noqa: E402

@@ -37,7 +37,7 @@ separated by two 192-d vectors. A direct projection to all ``Pmax * Cmax * 2`` o
 more parameters and actually fits.
 
 Coordinates are predicted in **crop space** -- [0,1] across the alpha the network is given --
-and converted back to the IR's local normalised space afterwards. See ``roto.model.geometry``
+and converted back to the IR's local normalised space afterwards. See ``roto.geometry``
 for why: local coordinates are absolute document positions whose range is up to 8x the crop,
 and regressing them directly was measured to stall at ~260 px.
 

@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from roto.model.geometry import crop_to_local, local_to_crop
+from roto.geometry import crop_to_local, local_to_crop
 from roto.render.raster import RenderConfig, apply_transform, shape_polyline
 from roto.sfx.json_ir import from_json_ir
 

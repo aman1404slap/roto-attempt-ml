@@ -23,7 +23,8 @@ import numpy as np
 import pytest
 
 from common import DATA
-from roto.dataset import CropConfig, build, discover, load_alpha, load_meta
+from roto.dataset import CropConfig, discover, load_alpha, load_meta
+from roto.dataset.build import build
 from roto.metrics import soft_iou
 from roto.program import decode, load_program
 from roto.render.raster import RenderConfig, render_union

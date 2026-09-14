@@ -1,27 +1,39 @@
-"""RotoLayer -> tensors the network trains on.
+"""v2 element -> tensors the network trains on.
 
-Targets are the *dense per-frame* control points, not the artist's key values. The network
-predicts geometry frame by frame; choosing which of those frames become keys is the DP's job
-(``roto.keys``), and keeping the two separate is what lets each be measured on its own.
+Ported from ``roto.model.data`` at v2 Step 2, with v2's vocabulary and v2's loaders. Three
+substitutions and nothing else, because the rest is arithmetic about the IR and the crop rather
+than a v1 decision:
 
-Dense tracks are built with ``roto.ir.sample`` rather than by interpolating the key arrays
-directly, so the target is exactly what the renderer would draw -- per-key interp modes
-included. The archive is ~75% linear and ~25% catmullrom, varying by shot, so re-deriving the
-interpolation here would silently disagree with the picture on a quarter of the segments.
+* alphas come from :func:`roto.v2.build.load_alpha`
+* the split record is v2's, keyed by ``element_id`` under ``elements`` -- v2 holds out whole
+  **shots** as well as frames and elements (:mod:`roto.v2.splits`), which the archive record
+  had no field for
+* ``LayerData`` is ``ElementData``; the unit is a v2 element, which is still one top-level
+  Silhouette layer
 
-Targets are stored in **crop space**, in [0,1] across the alpha the network is given, not in
-the IR's local normalised coordinates. See ``roto.geometry`` -- predicting local
-coordinates directly was measured to stall at ~260 px, because they are absolute document
-positions whose range is many times the crop the network can see. ``local`` is kept alongside
-so the conversion can be checked, and the local points are what the IR is rebuilt from.
+What it carries forward, and why each was measured rather than chosen:
 
-The **transform** target now follows the same rule, and did not before. ``affine`` is the
-document-space 6-number form v1 predicted; ``proj_crop`` is the same track expressed as the
-local-to-crop map of each frame, in the 8-number projective form that is actually lossless.
-Both are carried so the two can be compared on one checkpoint, but only ``proj_crop`` states
-the target in the space the picture depicts. See :func:`~roto.geometry.crop_matrix` and
-:func:`~roto.program.proj_from_matrix`.
+Targets are the **dense per-frame** control points, not the artist's key values. The network
+predicts geometry frame by frame; choosing which frames become keys is the DP's job
+(:mod:`roto.keys`), and keeping them separate is what lets each be measured on its own.
+
+Dense tracks are built with ``roto.ir.sample`` rather than by interpolating the key arrays, so
+the target is exactly what the renderer would draw -- per-key interp modes included. The
+archive is ~75% linear and ~25% catmullrom, so re-deriving interpolation here would silently
+disagree with the picture on a quarter of the segments.
+
+Targets are in **crop space**, [0,1] across the alpha the network is given, not the IR's local
+normalised coordinates. Predicting local coordinates directly was measured to stall at ~260 px,
+because they are absolute document positions whose range is many times the crop the network can
+see. ``local`` is kept alongside so the conversion can be checked, and the local points are what
+the IR is rebuilt from.
+
+The **transform** target follows the same rule. ``affine`` is the document-space 6-number form;
+``proj_crop`` is the same track as each frame's local-to-crop map, in the 8-number projective
+form that is actually lossless. Only ``proj_crop`` states the target in the space the picture
+depicts.
 """
+
 from __future__ import annotations
 
 import json
@@ -31,7 +43,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from ..dataset import load_alpha, load_splits
+from .build import load_alpha
+from .splits import load_splits
 from ..ir import opacity_at, sample
 from ..geometry import crop_matrix, local_to_crop
 from ..program import affine_from_matrix, proj_from_matrix
@@ -83,9 +96,9 @@ def group_probes(local: np.ndarray, live: np.ndarray, group_of: np.ndarray,
 
 
 @dataclass
-class LayerData:
+class ElementData:
     """One layer, fully materialised. Dense tracks dominate memory; ~200 MB for all 13."""
-    layer_id: str
+    element_id: str
     directory: Path
     frames: np.ndarray          # (F,)
     points: np.ndarray          # (F, S, Pmax, Cmax, 2) float32, [0,1] across the crop
@@ -127,7 +140,7 @@ class LayerData:
     ``in_train=False`` is a layer withheld from training *entirely*. It is not a
     generalisation claim -- shape queries are per ``(layer, shape)``, so such a layer has
     never had its query rows updated -- it is how much of the headline number lives in the
-    query table. See ``roto.dataset.splits``."""
+    query table. See ``roto.v2.splits``."""
 
     @property
     def n_shapes(self) -> int:
@@ -240,7 +253,7 @@ class LayerData:
         """``(train_idx, held_idx)`` frame positions. ``holdout_every <= 0`` holds nothing.
 
         **A dataset that records its own split wins.** ``datasets/v002`` writes
-        ``splits.json`` at build time (``roto.dataset.splits``), and when it is present this
+        ``splits.json`` at build time (``roto.v2.splits``), and when it is present this
         returns it verbatim and ignores ``holdout_every`` -- because the split is then a
         property of the data, and two runs quoting a held-out gap over different frames is
         the failure the record exists to prevent. ``datasets/v001`` has no record, so the
@@ -265,6 +278,68 @@ class LayerData:
         return train, held
 
 
+def canonical_order(el: ElementData) -> np.ndarray:
+    """Permutation of shape indices for charter S4 stage **S3**: transform group, then centroid.
+
+    At S0-S2 a query is a learned row per ``(element, shape)``, so "which shape is slot 5"
+    needs no answer -- the row *is* the answer. S3 removes those rows and shares one bank of
+    slots across every element, and then the question becomes unavoidable: the model has to
+    know which shape belongs in which slot, and the ordering has to be something it could
+    work out **from the picture**.
+
+    Document order will not do. "The fifth shape in the artist's file" is unknowable from a
+    cutout -- it is a fact about how she built the file, not about what it looks like. Plan
+    section 6's answer is to sort by transform group, then by centroid ``(y, x)`` at a
+    reference frame, and both halves are inferable: the groups move differently, and a
+    centroid is a position in the picture.
+
+    The reference frame is **the frame with the most live shapes**, earliest on a tie, rather
+    than frame 0. A shape that is not on screen at the reference frame has no centroid there,
+    and on this archive frame 0 has nothing on screen for several elements; the busiest frame
+    is where the fewest shapes need the fallback below.
+
+    A shape absent at the reference frame is placed by its centroid at its own first live
+    frame. That is a compromise and worth stating: two shapes ordered on different frames are
+    not strictly comparable. The alternative -- dropping them to the end -- makes slot
+    assignment depend on lifespan, which S2's head predicts imperfectly, so an error there
+    would silently reshuffle every later slot.
+    """
+    live_count = el.live.sum(axis=1)
+    ref = int(np.argmax(live_count)) if live_count.max() else 0
+    keys = []
+    for si in range(el.n_shapes):
+        fi = ref if el.live[ref, si] else int(np.argmax(el.live[:, si])) \
+            if el.live[:, si].any() else 0
+        pts = el.points[fi, si][el.point_mask[si]]
+        c = pts.reshape(-1, 2).mean(0) if pts.size else np.zeros(2, np.float32)
+        keys.append((int(el.group_of[si]), float(c[1]), float(c[0]), si))
+    return np.array([k[3] for k in sorted(keys)], np.int64)
+
+
+def query_desc(el: ElementData, give_point_count: bool = True) -> np.ndarray:
+    """The per-shape descriptor the query is conditioned on: ``(S, 3)`` or ``(S, 2)``.
+
+    ``desc`` is ``(n_points / Pmax, closed, coords_per_point / Cmax)``. At S0 and S1 all three
+    are given. At **S2 the first one is the training wheel coming off** -- charter S4 declares
+    the given structure at that stage to be shape count and identity, and a point count is
+    neither, so it leaves the input and becomes something the model has to produce.
+
+    ``closed`` and ``coords_per_point`` stay. They are shape *type* rather than shape
+    structure -- whether this is a B-spline or a Bezier, and whether the curve closes -- and
+    plan section 5 asks for the count "over allowed counts **per shape type**", which presumes
+    the type is known.
+
+    Removing the column does **not** make the count unmemorisable, and the design note is
+    explicit that it does not: the per ``(element, shape)`` query row can carry the count and
+    the count loss will put it there. What removal buys is that the count no longer reaches
+    the model on a path that bypasses learning altogether.
+
+    Sliced here rather than rebuilt in ``load_element`` so that one dataset serves every stage
+    and a stage is a flag on the run, not a second copy of the alphas.
+    """
+    return el.desc if give_point_count else el.desc[:, 1:]
+
+
 def _group_index(mats: np.ndarray) -> tuple[np.ndarray, int]:
     """Collapse identical per-shape transform tracks to a group index. Exact equality: shapes
     under one tracked layer share the same matrices by construction."""
@@ -276,7 +351,7 @@ def _group_index(mats: np.ndarray) -> tuple[np.ndarray, int]:
     return idx, len(keys)
 
 
-def load_element(directory: str | Path, with_local: bool = True) -> LayerData:
+def load_element(directory: str | Path, with_local: bool = True) -> ElementData:
     """Materialise one layer.
 
     ``with_local=False`` skips keeping the IR-native copy of the control points. It is the
@@ -307,7 +382,7 @@ def load_element(directory: str | Path, with_local: bool = True) -> LayerData:
     pos = {int(f): k for k, f in enumerate(mframes)}
 
     # The artist's own keyframes, as a per-frame mask on the rendered frame axis. This is
-    # the key-timing head's target; see LayerData.key_mask for why keys outside the rendered
+    # the key-timing head's target; see ElementData.key_mask for why keys outside the rendered
     # range are dropped rather than clamped.
     at_frame = {int(f): i for i, f in enumerate(frames)}
     key_mask = np.zeros((len(frames), n), bool)
@@ -367,11 +442,11 @@ def load_element(directory: str | Path, with_local: bool = True) -> LayerData:
         local = np.zeros((0,), np.float32)
     # The dataset's own split, when it has one. Read here rather than in train() so that
     # every consumer -- training, scoring, the gate script -- sees the same one.
-    rec = (load_splits(d.parent) or {}).get('layers', {}).get(meta['layer']['layer_id'], {})
+    rec = (load_splits(d.parent) or {}).get('elements', {}).get(meta['element']['element_id'], {})
     pos = {int(f): i for i, f in enumerate(frames)}
     tr = np.array([pos[f] for f in rec.get('frames_train', []) if f in pos], np.int64)
     he = np.array([pos[f] for f in rec.get('frames_held', []) if f in pos], np.int64)
-    return LayerData(meta['layer']['layer_id'], d, frames, points, local, live, affine,
+    return ElementData(meta['element']['element_id'], d, frames, points, local, live, affine,
                        group_of, desc, pmask, float(crop['px_per_norm']), matrices,
                        {'width': source['width'], 'height': source['height'],
                         'scale': crop['scale'], 'out_px': out_px, 'offsets': offsets,
@@ -389,7 +464,7 @@ def load_element(directory: str | Path, with_local: bool = True) -> LayerData:
 
 
 def load_dataset(root: str | Path, with_local: bool = True,
-                 trained_only: bool = False) -> list[LayerData]:
+                 trained_only: bool = False) -> list[ElementData]:
     """Every layer of a built dataset, in directory order.
 
     ``trained_only`` drops the layers the dataset's own split withholds from training. It is
