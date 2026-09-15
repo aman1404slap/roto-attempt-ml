@@ -1,26 +1,82 @@
 # Moving training off the laptop: AWS GPU migration
 
-**Status: the service is built; the infrastructure is not. Written 2026-09-14, updated
-2026-09-15.**
+**Status: the service is built and runs end to end. Nothing is on AWS yet.**
+Written 2026-09-14, updated 2026-09-15.
 
-What landed on 2026-09-15: the Django service (§3.3), environment stamping (§5.4), the pinned
-environment (§5.6) and parameterised run paths. v1 was deleted in the same pass. What is still
-open is everything that needs an AWS account — §4, §7's gates — plus §5.1, §5.2, §5.3 and §5.5.
-[docs/service.md](docs/service.md) is how the service works.
-
-Two premises changed and are corrected in place below: **local keeps CUDA** (so §2 and §5.7
-fall away), and **real training happens on AWS only** — local is a smoke test, nothing more.
-
-The laptop GPU is going away as the place results come from. At the same time the target dataset is moving from 10 shots to a number two orders of magnitude
-larger. This note says what we need, what has to change in the code before a cloud run can be
-trusted, and what the two scales imply.
+The laptop GPU is going away as the place results come from. At the same time the target dataset
+is moving from 10 shots to a number two orders of magnitude larger. This note says what we need,
+what has to change in the code before a cloud run can be trusted, and what the two scales imply.
 
 **Written the way the design notes are: measured first.** Every number in §1 comes off
 `runs/v2/*/train_log.json`, which has recorded the cost of every run since S0 precisely so this
 decision would not have to be made on taste. Sources in the appendix.
 
 The infrastructure request is a separate, forwardable document:
-**[devops-requirements.md](devops-requirements.md)**.
+**[devops-requirements.md](devops-requirements.md)**. How the service works is
+**[docs/service.md](docs/service.md)**.
+
+---
+
+## 0. Status
+
+### Done, and verified running
+
+| | where |
+|---|---|
+| The Django service: `POST /runs`, `GET /runs/<id>`, `POST /runs/<id>/stop` (§3.3) | `roto_app/` |
+| `ecs:RunTask` launcher, and a local executor running the identical command | `services/launcher.py` |
+| Dataset build, train and score as management commands — one image, three jobs | `management/commands/` |
+| Environment stamping and the refusal to table a local run (§5.4) | `roto/v2/provenance.py` |
+| Pinned torch and CUDA base image (§5.6) | `requirements_inference.txt`, `Dockerfile` |
+| Parameterised run paths — a run writes to scratch and is synced, not into the repo tree | `--runs-root` |
+| v1 deleted | — |
+
+**Verified end to end on 2026-09-15, with no AWS at all:** `POST /api/runs` created the row and
+launched a detached process, the dataset synced in, S3A trained on the GPU, the run directory
+synced back, `GET` reported every stage timed, and scoring **refused** the result because it was
+stamped `local`. That is the whole path the ECS task will take, minus the bucket and `RunTask`.
+
+### The interim: local runs against a folder, not a bucket
+
+There is no bucket yet, and waiting for one would have meant the service could not be run at all.
+So the storage root is a **setting**, not a fact:
+
+| | local, today | staging, once it exists |
+|---|---|---|
+| `STORAGE_ROOT` | `abc/` — a gitignored folder | `s3://<bucket>` |
+| `SOURCE_ROOT` | `data/spline_dataset_08_25_26` | `s3://production-citadel/<prefix>` |
+| `RUN_EXECUTOR` | `local` — a subprocess here | `ecs` — a GPU task |
+
+**The layout inside the root is identical either way** (`datasets/<version>/`,
+`runs/staging/<run>/`, `runs/local/<user>/<run>/`), so local is staging with a different root
+rather than a second design. Switching over is three environment variables, and the code either
+side of them is code that has already been exercised.
+
+### Blocked on infrastructure
+
+Nothing below can start without an AWS account to put it in — see §4.1 for what each needs.
+
+| | blocked on |
+|---|---|
+| The S3 backing of the same sync calls | the staging bucket |
+| `ecs:RunTask` against a real cluster | ECS cluster, ECR, task definition, IAM |
+| Gate 1 — rebuild `v003` from prod and prove it byte-identical (§7) | cross-account read, KMS |
+| Gate 2 — re-measure the seed spread on the new GPU (§7) | GPU capacity |
+| A run table that outlives a laptop | RDS |
+
+### Still ours to do, and not blocked
+
+| | why it matters |
+|---|---|
+| **§5.1 lazy alpha loading** | ~75 GB of host RAM at 1,000 shots. Precondition for sizing. |
+| **§5.2 mid-run checkpoint and resume** | `stop` currently discards a run; a reclaimed task loses hours. |
+| **§5.3 slot-cap policy** | The API will accept a run that dies on `ValueError` twenty minutes in. |
+| **§5.5 source checksums in the manifest** | What makes Gate 1 a test rather than an impression. |
+
+### Premises that changed, corrected in place below
+
+**Local keeps CUDA** — so §2 and §5.7 fall away. **Real training happens on AWS only**; local is
+a smoke test and never produces a quotable number.
 
 ---
 
@@ -125,9 +181,13 @@ Two environments, one source of truth, one writable bucket.
   └─────────┬───────────┘        └──────────────┬──────────────┘
             │ writes                            │ writes
             ▼                                   ▼
-  s3://<staging-bucket>/runs/local/…   s3://<staging-bucket>/runs/staging/…
+  <storage>/runs/local/<user>/…        <storage>/runs/staging/…
                           account B, READ-WRITE — to be created
 ```
+
+``<storage>`` is one setting. It is ``s3://<bucket>`` as drawn, and a gitignored folder — ``abc``
+— until that bucket exists. The layout inside is the same either way, so the diagram is the
+design in both cases and only the root moves (§0).
 
 ### 3.1 The two environments
 
@@ -144,17 +204,23 @@ routing local through staging's bucket too.
 storage layer and one set of credentials, and it means a local run is a staging run with a
 smaller argument list rather than a different code path.
 
+*Today local reads and writes a folder instead, because the bucket does not exist yet* — but
+under the same four prefixes, through the same code, so this remains the design rather than an
+aspiration to migrate to later.
+
 ### 3.2 Bucket layout
 
 | path | who writes | what |
 |---|---|---|
-| `s3://production-citadel/<prefix>/` | **nobody — read only** | the archive: `.sfx`, EXRs, plates |
-| `s3://<staging>/datasets/<version>/` | build step | derived training data (19 MB → ~1.9 GB) |
-| `s3://<staging>/runs/staging/<run>/` | staging | real runs: checkpoints, logs, scores |
-| `s3://<staging>/runs/local/<user>/<run>/` | local | smoke tests |
+| `<source>/` | **nobody — read only** | the archive: `.sfx`, EXRs, plates |
+| `<storage>/datasets/<version>/` | build step | derived training data (19 MB → ~1.9 GB) |
+| `<storage>/runs/staging/<run>/` | staging | real runs: checkpoints, logs, scores |
+| `<storage>/runs/local/<user>/<run>/` | local | smoke tests |
 
-**The rule that makes this safe: nothing under `runs/local/` may ever be quoted as a result**,
-and that should be enforced in code rather than remembered (§5.4).
+**The rule that makes this safe: nothing under `runs/local/` may ever be quoted as a result.**
+It is enforced in code rather than remembered (§5.4), and by two independent mechanisms: the
+prefix, and a stamp inside the checkpoint that scoring refuses. The prefix alone would not
+survive someone copying a file.
 
 ### 3.3 API-triggered training
 
@@ -206,6 +272,41 @@ account and silently exclude it.
 
 All three are questions in [devops-requirements.md](devops-requirements.md).
 
+### 4.1 What devops delivers, and what unblocks the moment it lands
+
+The forwardable version of this is [devops-requirements.md](devops-requirements.md). This table
+is the same list read from our side: what we do the moment each piece exists, so nothing waits on
+a hand-off nobody scheduled.
+
+| devops delivers | we then | lead time |
+|---|---|---|
+| **Staging S3 bucket**, our account, read/write | set `STORAGE_ROOT=s3://<bucket>` and re-run the same flow against S3. Nothing else changes. | ours — not waiting on anyone |
+| **Cross-account read** on `s3://production-citadel` (+ **KMS key policy**, + **VPC endpoint policy** if private subnets) | set `SOURCE_ROOT` and run **Gate 1**: rebuild `v003` from prod and prove it byte-identical | other account, other team — **start day one** |
+| **ECR repository `roto`** | `ci/build.py` pushes the image; CircleCI is already written | short |
+| **ECS cluster with GPU capacity** (`g6.xlarge`/`g5.xlarge`, EC2 capacity provider, scale to zero) + **G-family vCPU quota** | set `RUN_EXECUTOR=ecs` and run **Gate 2**: re-measure the seed spread on the new GPU | quota request is the long pole |
+| **Task definition** — one container, **no default command**, GPU resource requirement | nothing; the service passes the command per job | with the cluster |
+| **Task role** (`s3:GetObject`/`ListBucket` on prod, read/write on ours) and **execution role** | nothing | with the cluster |
+| **API service role**: `ecs:RunTask`, `ecs:DescribeTasks`, `ecs:StopTask`, `iam:PassRole`, `logs:GetLogEvents` | nothing | with the cluster |
+| **RDS Postgres** (small — a handful of rows a week) | point `DATABASE_URL` at it and `migrate` | short |
+| **CloudWatch log group** | nothing | with the cluster |
+
+**Three things worth saying explicitly to whoever picks this up:**
+
+**The task definition needs no default command, and should not have one.** One image does three
+jobs — build a dataset, train a rung, score a run — and the service picks per invocation with a
+container command override. A default command means a container that starts training by accident.
+
+**The cluster must scale to zero and must be allowed to take a while.** Usage is a few jobs a
+week, and the first request after an idle period legitimately fails placement with
+`RESOURCE:GPU` while capacity comes up. The service already tells that apart from a task
+definition that is simply wrong, and reports it as "still scaling" rather than as an error.
+
+**`KMS` is the one that fails silently.** If prod objects are encrypted with a customer-managed
+key, a bucket policy alone is not enough — the task role needs `kms:Decrypt` in the **key policy
+in the prod account**, and without it the failure is a bare `AccessDenied` with nothing pointing
+at KMS. It is a separate resource, often owned by a separate team, and it is worth asking about
+in the same message as the bucket policy rather than discovering it later.
+
 ## 5. Code changes, ranked
 
 ### 5.1 Lazy alpha loading — blocking at any scale above ~200 shots
@@ -228,7 +329,9 @@ so it is debugged before it is load-bearing.
 everything — and at 1,000 shots the runs get much longer than 31 minutes.
 
 It is also what makes an API-triggered job safe to retry, and what lets a task be reclaimed or
-rescheduled without losing the run.
+rescheduled without losing the run. **That is no longer hypothetical:** `POST /runs/<id>/stop`
+exists and works, and what it currently does is *discard* the run rather than pause it. The
+endpoint's docstring says so, which is honest but is not a fix.
 
 Needed: `state_dict` + optimizer + scheduler + step counter + RNG state written every N steps, and
 a `--resume` that picks up from the last one. Perhaps 40 lines, plus a test that kills a run
@@ -303,18 +406,29 @@ written and there is no third device to teach it about.
 and device name only when `device.type == 'cuda'`. Harmless, except that this log is exactly what
 §1 is built from — losing it on other hardware costs us the next version of this decision.
 
-### 5.9 Keep boto3 out of the training path
+### 5.9 Keep boto3 out of the training path — **done, and it held**
 
 Sync to local disk, then run the existing code unchanged. The code reads plain local paths
 ([build.py:174](src/roto/v2/build.py#L174)) and that is the right design — an S3-native data layer
-would be a rewrite in exchange for nothing. The worker does:
+would be a rewrite in exchange for nothing.
 
-```bash
-aws s3 sync s3://production-citadel/<prefix> ./data/...      # read-only, prod account
-PYTHONPATH=src python -m roto.v2.dataset ...                  # unchanged
-aws s3 sync ./datasets/<version> s3://<staging>/datasets/<version>
-aws s3 sync ./runs/v2 s3://<staging>/runs/<environment>/
+**This survived contact.** `src/roto/` has no `boto3` in it and no knowledge the service exists;
+the sync is three calls in `roto_app/helpers/storage.py`, and `train_service.py` does exactly
+what this section proposed:
+
 ```
+sync_in   <storage>/datasets/<version>/   ->  <scratch>/datasets/<version>
+train     roto.v2.train.train(...)             unchanged, on plain local paths
+sync_out  <scratch>/runs/<run>/           ->  <storage>/runs/<environment>/<run>/
+```
+
+The one thing the design bought that was not foreseen: because the training path never learned
+what a bucket is, **swapping S3 for a folder was a change to one module**, which is what let the
+whole flow be run and debugged before any infrastructure existed.
+
+A second boundary was added for the same reason and is worth recording — **the web process never
+imports torch.** Validating a rung name must not drag in the training stack, or the API service
+needs the GPU image; `roto.v2.rungs` imports a dataclass and nothing else, and a test holds it.
 
 ### 5.10 Two seeds: decide about concurrency explicitly
 
@@ -339,6 +453,11 @@ mostly about who is permitted to hold client footage, not about engineering.
 
 At 1,000 shots the build is itself a substantial job and probably wants to be its own queued task
 rather than a step inside the training job.
+
+**Settled in the build:** the build is `manage.py build_dataset`, a separate command from
+`train_run`, needing no GPU. So all three placements remain open and the choice stays the
+access-policy question it is — nothing in the code decides it. Today it reads the archive
+already on disk; pointing `SOURCE_ROOT` at prod is what moves it.
 
 ## 7. Two gates before any new science
 
@@ -366,20 +485,24 @@ is** until we measure it. One hour, and it protects every number downstream.
 
 ## 8. Order of operations
 
-**Lazy alpha loading (§5.1) lands before the infrastructure is provisioned**, so capacity is
-sized against the real memory profile rather than the 75 GB one. Everything else on the right
-proceeds in parallel with the requests on the left.
+The right-hand column is now mostly struck through, which is the point of the update: the work
+that did not need an AWS account is done, and what remains on our side is §5.1, §5.2, §5.3 and
+§5.5. **Lazy alpha loading (§5.1) should still land before capacity is sized**, so the instance
+is chosen against the real memory profile rather than the 75 GB one.
 
 | external lead time — start day one | ours, meanwhile |
 |---|---|
-| G-family vCPU quota request | **lazy alpha loading (§5.1) — precondition** |
+| G-family vCPU quota request | **lazy alpha loading (§5.1) — precondition for sizing** |
 | `production-citadel` bucket policy, other account | checkpoint/resume (§5.2) |
-| KMS key policy question | ~~pin the environment (§5.6)~~ — done |
-| ECS cluster + ECR repository `roto` | manifest checksums (§5.5) |
-| RDS instance for the service's run table | ~~environment stamping (§5.4)~~ — done |
+| KMS key policy question — *the silent one* | slot-cap policy (§5.3) |
+| ECS cluster + task definition + ECR repository `roto` | manifest checksums (§5.5) |
+| RDS instance for the service's run table | ~~pin the environment (§5.6)~~ — done |
+| | ~~environment stamping (§5.4)~~ — done |
 | | ~~the service itself (§3.3)~~ — done |
 
-The staging bucket is ours to create; it is not waiting on anyone.
+**The staging bucket is ours to create; it is not waiting on anyone**, and it is the single
+highest-value thing on the list — it converts the folder-backed path we have already run into
+the real one, on its own, without the cluster.
 
 ## 9. Open questions
 
@@ -395,9 +518,10 @@ The staging bucket is ours to create; it is not waiting on anyone.
    `OPENCV_IO_ENABLE_OPENEXR` env var is already handled
    ([exr.py:32](src/roto/exr.py#L32)); the wheel's build options are what vary.
 6. **Sequential or concurrent seeds** (§5.10) — decide and record.
-7. **What is the slot-cap policy?** Unchanged from question 3 and now more pressing: the API
-   will happily accept a run against a dataset built from wide layers, and the failure is a
-   `ValueError` twenty minutes into a GPU task.
+
+Question 3 is the most pressing of these now that runs are triggered rather than typed: the API
+will accept a run against a dataset built from wide layers, and the failure is a `ValueError`
+twenty minutes into a GPU task that has already been paid for.
 
 ---
 
