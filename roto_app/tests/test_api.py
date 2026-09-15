@@ -14,6 +14,7 @@ from unittest import mock
 
 from django.test import TestCase, override_settings
 
+from roto_app.helpers.aws_helpers import S3Unavailable, s3_prefix_exists
 from roto_app.models.run import Run
 
 API_KEY = "test-key"
@@ -74,6 +75,19 @@ class CreateRunTests(TestCase):
         response = self.post({"environment": "prod"}, **HEADERS)
         self.assertEqual(response.status_code, 400)
         self.assertFalse(Run.objects.exists())
+
+    def test_an_unreachable_s3_is_503_not_400(self):
+        """ "Not there" and "could not ask" are different answers.
+
+        Reporting an unset bucket or absent credentials as "dataset v003 does not exist" sends
+        whoever hit it looking in the wrong place. 503 says the fault is ours.
+        """
+        self.exists.side_effect = S3Unavailable("AWS_DEFAULT_BUCKET is not set")
+        response = self.post({}, **HEADERS)
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("AWS_DEFAULT_BUCKET", response.json()["data"]["errors"])
+        self.assertFalse(Run.objects.exists())
+        self.launch.assert_not_called()
 
     def test_rejects_a_dataset_that_is_not_in_the_bucket(self):
         """Checked before launching. A typo'd version otherwise costs a GPU task that starts,
@@ -221,3 +235,36 @@ class WebProcessStaysLightTests(TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "clean")
+
+
+class S3PreflightTests(TestCase):
+    """The pre-flight check itself: it must not turn a configuration fault into a 'no'."""
+
+    def test_an_unset_bucket_raises_rather_than_returning_false(self):
+        with self.assertRaises(S3Unavailable) as caught:
+            s3_prefix_exists(bucket="", prefix="datasets/v003")
+        self.assertIn("AWS_DEFAULT_BUCKET", str(caught.exception))
+
+    @mock.patch("roto_app.helpers.aws_helpers.subprocess.run")
+    def test_a_cli_failure_surfaces_its_stderr(self, run):
+        """`Unable to locate credentials` tells you what to do; `exit status 252` does not."""
+        run.return_value = mock.Mock(
+            returncode=252, stdout="", stderr="Unable to locate credentials"
+        )
+        with self.assertRaises(S3Unavailable) as caught:
+            s3_prefix_exists(bucket="a-bucket", prefix="datasets/v003")
+        self.assertIn("Unable to locate credentials", str(caught.exception))
+
+    @mock.patch("roto_app.helpers.aws_helpers.subprocess.run")
+    def test_it_is_not_retried(self, run):
+        """It runs inside a web request, and its failures are configuration -- which fails
+        identically four times while the caller waits twenty-one seconds."""
+        run.return_value = mock.Mock(returncode=252, stdout="", stderr="boom")
+        with self.assertRaises(S3Unavailable):
+            s3_prefix_exists(bucket="a-bucket", prefix="datasets/v003")
+        self.assertEqual(run.call_count, 1)
+
+    @mock.patch("roto_app.helpers.aws_helpers.subprocess.run")
+    def test_a_missing_prefix_is_a_plain_false(self, run):
+        run.return_value = mock.Mock(returncode=0, stdout="{}", stderr="")
+        self.assertFalse(s3_prefix_exists(bucket="a-bucket", prefix="datasets/v999"))

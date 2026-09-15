@@ -9,6 +9,7 @@ STATUS_CODE_200 = 200
 STATUS_CODE_400 = 400
 STATUS_CODE_401 = 401
 STATUS_CODE_404 = 404
+STATUS_CODE_503 = 503  # we could not do our job, as distinct from 400: you asked wrongly
 
 
 def format_response(message="", status_code=STATUS_CODE_200, data=None):

@@ -80,14 +80,34 @@ def sync_local_to_s3(*, src_path: str, s3_uri: str) -> None:
     _run(["aws", "s3", "sync", ensure_suffix(src_path, "/"), ensure_suffix(s3_uri, "/")])
 
 
-@retry_on_failure()
+class S3Unavailable(RuntimeError):
+    """S3 could not be asked the question -- no bucket configured, no credentials, no access.
+
+    Distinct from "the prefix is not there", which is a legitimate ``False``. Conflating the two
+    is how a missing ``AWS_DEFAULT_BUCKET`` turns into "dataset v003 does not exist", which sends
+    whoever hit it looking in the wrong place entirely.
+    """
+
+
 def s3_prefix_exists(*, bucket: str, prefix: str) -> bool:
     """Whether anything exists under a prefix.
 
-    Used before a build to refuse silently overwriting an existing dataset version, and before
-    a training run to say "that dataset version is not in the bucket" as a 400 rather than as
-    a GPU task that starts, syncs nothing and trains on an empty directory.
+    Used before a build to refuse silently overwriting an existing dataset version, and before a
+    training run to say "that dataset version is not in the bucket" as a 400 rather than as a
+    GPU task that starts, syncs nothing and trains on an empty directory.
+
+    **Not retried, unlike the syncs.** This runs inside a web request, and the failures it
+    actually sees are configuration -- an unset bucket, absent credentials, a policy that does
+    not allow the list. Those fail identically four times while the caller waits twenty-one
+    seconds for an answer that was available immediately.
     """
+    if not bucket:
+        raise S3Unavailable(
+            "AWS_DEFAULT_BUCKET is not set, so there is no bucket to look in. Set it in .env "
+            "(see .env.example), or run with RUN_EXECUTOR=local against a dataset already on "
+            "disk."
+        )
+
     proc = subprocess.run(  # nosec
         [
             "aws",
@@ -107,8 +127,11 @@ def s3_prefix_exists(*, bucket: str, prefix: str) -> bool:
         text=True,
     )
     if proc.returncode != 0:
-        print(f"list-objects-v2 failed: {proc.stderr.strip()}")
-        raise subprocess.CalledProcessError(proc.returncode, "list-objects-v2", stderr=proc.stderr)
+        # The CLI's own stderr, not the exit code. "Unable to locate credentials" tells you what
+        # to do; "returned non-zero exit status 252" tells you nothing.
+        raise S3Unavailable(
+            f"could not list s3://{bucket}/{prefix}: {proc.stderr.strip() or 'no stderr'}"
+        )
     return '"Contents"' in proc.stdout
 
 

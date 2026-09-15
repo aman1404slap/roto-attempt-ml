@@ -101,8 +101,14 @@ python manage.py train_run --create --rung s3a --seed 1 --steps 200
 
 ```bash
 pytest                          # the science: 108 tests, no database, no Django
-python manage.py test roto_app  # the service: 17 tests, sqlite is fine
+python manage.py test roto_app  # the service: 22 tests, against the compose Postgres
 ```
+
+Verified end to end on 2026-09-15: compose Postgres up, `migrate`, the API over HTTP, and a
+real 60-step S3A run on `datasets/v003` whose checkpoint carried
+`environment: local` — which `score_v2.py` then refused to table, and tabled under
+`--allow-local` with `environment local` in the header. What has *not* been exercised is the S3
+sync on either end, which needs the bucket and the cross-account read.
 
 ## Deployment
 

@@ -176,7 +176,7 @@ Two suites, because there are two codebases and the boundary between them is the
 
 ```bash
 pytest                            # the science: 108 tests, ~25s — they render real frames
-python manage.py test roto_app    # the service: 17 tests, sqlite is fine
+python manage.py test roto_app    # the service: 22 tests, needs the compose Postgres
 PYTHONPATH=src python -m roto.v2 ledger datasets/v003   # the exactness ledger
 ```
 

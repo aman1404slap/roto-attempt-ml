@@ -58,7 +58,13 @@ def main() -> None:
             print(f'{name}: nothing to score')
             continue
         print()
-        table = frozen_table(runs, label=f'v2 {name.upper()}', allow_local=args.allow_local)
+        try:
+            table = frozen_table(runs, label=f'v2 {name.upper()}',
+                                 allow_local=args.allow_local)
+        except ValueError as e:
+            # A refusal is an answer, not a crash. The message says what to do; a traceback
+            # on top of it only makes it look like the tool broke.
+            sys.exit(f'\n{e}')
         print(table)
         out = Path(args.runs_root) / f'{name}_summary.json'
         out.parent.mkdir(parents=True, exist_ok=True)
