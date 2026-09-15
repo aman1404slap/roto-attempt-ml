@@ -1,7 +1,7 @@
 """Score finished runs into the frozen table.
 
-Pulls the seeds' run directories and the dataset down from our bucket, scores them with the
-existing code, and pushes the table and summary back beside the runs.
+Pulls the seeds' run directories and the dataset down from the storage root, scores them with
+the existing code, and puts the table and summary back beside the runs.
 
     python manage.py score_run --rung s3a --seeds 1 2 --dataset-version v003
 
@@ -15,10 +15,10 @@ import json
 from pathlib import Path
 
 from django.conf import settings
-from django.core.management import BaseCommand
+from django.core.management import BaseCommand, CommandError
 from sentry_sdk import capture_exception, new_scope
 
-from roto_app.helpers import aws_helpers
+from roto_app.helpers import storage
 from roto_app.services import paths
 
 
@@ -52,14 +52,12 @@ class Command(BaseCommand):
         environment = options.get("environment") or settings.ROTO_ENVIRONMENT
 
         dataset_dir = paths.local_dataset_dir(version)
-        aws_helpers.sync_s3_to_local(s3_uri=paths.dataset_uri(version), dest_path=dataset_dir)
+        storage.sync_in(src=paths.dataset_uri(version), dest_path=dataset_dir)
 
         runs_root = Path(paths.local_runs_root())
         for seed in options["seeds"]:
             name = f"{rung}_seed{seed}"
-            aws_helpers.sync_s3_to_local(
-                s3_uri=paths.run_uri(name, environment), dest_path=str(runs_root / name)
-            )
+            storage.sync_in(src=paths.run_uri(name, environment), dest_path=str(runs_root / name))
 
         try:
             from roto.v2.reconstruct import RebuildConfig
@@ -82,11 +80,20 @@ class Command(BaseCommand):
                 scored.append(dict(score_run(checkpoint, dataset_dir, cfg, seed=seed), seed=seed))
 
             if not scored:
-                raise SystemExit(f"{rung}: nothing to score")
+                raise CommandError(f"{rung}: nothing to score")
 
-            table = frozen_table(
-                scored, label=f"v2 {rung.upper()}", allow_local=options.get("allow_local", False)
-            )
+            try:
+                table = frozen_table(
+                    scored,
+                    label=f"v2 {rung.upper()}",
+                    allow_local=options.get("allow_local", False),
+                )
+            except ValueError as refusal:
+                # A refusal is an answer, not a crash. It is also not a Sentry event: the
+                # guarantee working as designed is the most ordinary thing that can happen here.
+                raise CommandError(str(refusal)) from None
+        except CommandError:
+            raise
         except Exception as e:
             with new_scope() as scope:
                 scope.set_tag("command", "score_run")
@@ -103,9 +110,7 @@ class Command(BaseCommand):
         table_path.write_text(table)
 
         if not options.get("no_upload"):
-            destination = paths.bucket_uri(f"runs/{environment}")
+            destination = paths.runs_uri(environment)
             for path in (summary_path, table_path):
-                aws_helpers.copy_local_file_to_s3(
-                    src_path=str(path), s3_uri=f"{destination}/{path.name}"
-                )
+                storage.copy_file_out(src_path=str(path), dest=storage.join(destination, path.name))
             print(f"scores written beside the runs under {destination}")

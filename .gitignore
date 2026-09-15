@@ -28,5 +28,7 @@ steps/
 # Django service
 /.env
 /.scratch/
+# the local stand-in for the staging bucket: datasets/ and runs/ live in here
+/abc/
 /staticfiles/
 /infra/

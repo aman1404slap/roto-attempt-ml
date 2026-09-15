@@ -17,8 +17,8 @@ from django.contrib.auth import get_user_model
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
-from roto_app.helpers import ecs
-from roto_app.helpers.aws_helpers import S3Unavailable, s3_prefix_exists
+from roto_app.helpers import ecs, storage
+from roto_app.helpers.storage import S3Unavailable
 from roto_app.helpers.utils import (
     STATUS_CODE_400,
     STATUS_CODE_401,
@@ -91,20 +91,18 @@ def create_run(request):
         # mistake, the second is ours, and reporting an unconfigured bucket as a missing dataset
         # sends whoever hit it looking in the wrong place.
         try:
-            dataset_present = s3_prefix_exists(
-                bucket=settings.AWS_DEFAULT_BUCKET, prefix=paths.dataset_key(version)
-            )
+            dataset_present = storage.prefix_exists(paths.dataset_uri(version))
         except S3Unavailable as e:
             return format_response(
-                "Cannot reach S3 to check the dataset",
+                "Cannot reach storage to check the dataset",
                 status_code=STATUS_CODE_503,
                 data={"errors": str(e)},
             )
         if not dataset_present:
             return format_response(
-                f"Dataset {version} is not in the bucket",
+                f"Dataset {version} is not in storage",
                 status_code=STATUS_CODE_400,
-                data={"expected": paths.dataset_uri(version)},
+                data={"expected": storage.describe(paths.dataset_uri(version))},
             )
 
         run = Run.objects.create(

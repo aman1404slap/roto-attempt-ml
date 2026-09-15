@@ -67,7 +67,7 @@ below.
 docker compose up -d db
 
 # 2. Config
-cp .env.example .env          # set AWS_DEFAULT_BUCKET and ROTO_APP_TASK_API_KEY
+cp .env.example .env          # set ROTO_APP_TASK_API_KEY; STORAGE_ROOT=abc needs no AWS
 
 # 3. Schema
 python manage.py migrate
@@ -104,11 +104,19 @@ pytest                          # the science: 108 tests, no database, no Django
 python manage.py test roto_app  # the service: 22 tests, against the compose Postgres
 ```
 
-Verified end to end on 2026-09-15: compose Postgres up, `migrate`, the API over HTTP, and a
-real 60-step S3A run on `datasets/v003` whose checkpoint carried
-`environment: local` — which `score_v2.py` then refused to table, and tabled under
-`--allow-local` with `environment local` in the header. What has *not* been exercised is the S3
-sync on either end, which needs the bucket and the cross-account read.
+**Verified end to end on 2026-09-15, with `STORAGE_ROOT=abc`** — the whole flow, no AWS:
+
+1. `POST /api/runs` → row created, subprocess launched, 202-ish response with the run id
+2. dataset synced `abc/datasets/v003` → scratch, S3A trained on the GPU (60 steps), run
+   directory synced back to `abc/runs/local/aman/s3a_seed1/`
+3. `GET /api/runs/<id>` reported `IN_PROGRESS/TRAINING` then `COMPLETED`, with every stage
+   timed and the cost numbers on the row
+4. `manage.py score_run --rung s3a --seeds 1` **refused** it as a local run; `--allow-local`
+   tabled it with `environment local` in the header and wrote the table beside the run
+5. `manage.py build_dataset` read the archive in place and published to `abc/datasets/`
+
+What is still unexercised is the **S3 backing** of that same code path and `ecs:RunTask` — both
+need the bucket and the cross-account read.
 
 ## Deployment
 
@@ -133,14 +141,35 @@ science suite should run in CI, it wants its own job on an image that already ha
 ## Storage layout
 
 ```
-s3://production-citadel/<prefix>/       nobody writes — the archive (other account, read-only)
-s3://<ours>/datasets/<version>/         build_dataset writes
-s3://<ours>/runs/staging/<run>/         staging runs
-s3://<ours>/runs/local/<user>/<run>/    smoke tests
+<source>/                            nobody writes — the archive: .sfx, EXRs, plates
+<storage>/datasets/<version>/        build_dataset writes
+<storage>/runs/staging/<run>/        staging runs
+<storage>/runs/local/<user>/<run>/   smoke tests
 ```
 
 Only `build_dataset` reads the archive, and it needs no GPU. Training reads the derived dataset
 and nothing else — which is why **the GPU task never has to hold client footage.**
+
+### Two roots, one layout
+
+`STORAGE_ROOT` and `SOURCE_ROOT` decide what `<storage>` and `<source>` are:
+
+| | local (today) | staging |
+|---|---|---|
+| `STORAGE_ROOT` | `abc` — a gitignored folder | `s3://<bucket>` |
+| `SOURCE_ROOT` | `data/spline_dataset_08_25_26` | `s3://production-citadel/<prefix>` |
+
+**The layout inside is identical either way**, which is the entire point: local is staging with a
+different root, not a second design, so the code that will run on ECS is the code that runs here.
+Switching back once the bucket exists is one environment variable.
+
+`roto_app/helpers/storage.py` is the only module that knows which backing is in play. Its folder
+mode is an *incremental* copy — size and mtime, the same fields `aws s3 sync` compares — so a
+dataset already on disk costs a stat per file rather than a re-copy, and neither mode ever
+deletes from the destination.
+
+One asymmetry, deliberate: when `SOURCE_ROOT` is a local directory the build **reads it in
+place** rather than copying it into scratch. It is 11 GB and the build only ever reads it.
 
 ## The two fences
 

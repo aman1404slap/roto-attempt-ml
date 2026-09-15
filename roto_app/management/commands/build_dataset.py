@@ -5,7 +5,7 @@ derived dataset and nothing else, so keeping the build separate is what lets the
 without ever holding client footage. On a large archive the build is a substantial job in its
 own right and wants to be its own queued task rather than a step inside a training job.
 
-    python manage.py build_dataset --version v003 --tier tier1
+    python manage.py build_dataset --dataset-version v004 --tier tier1
 
 The output is compared against what it replaces rather than trusted: rebuilding an existing
 version is refused unless ``--overwrite`` is passed, because a dataset version is the unit
@@ -17,7 +17,7 @@ from django.conf import settings
 from django.core.management import BaseCommand
 from sentry_sdk import capture_exception, new_scope
 
-from roto_app.helpers import aws_helpers
+from roto_app.helpers import storage
 from roto_app.helpers.utils import free_disk_gb
 from roto_app.services import paths
 
@@ -26,8 +26,11 @@ class Command(BaseCommand):
     help = "Sync the archive down, build a dataset version, sync it to our bucket."
 
     def add_arguments(self, parser):
+        # NOT --version: BaseCommand already defines that on every management command, and
+        # argparse rejects the clash at import time -- so the command does not merely misbehave,
+        # it cannot be loaded at all. Named to match score_run's flag while we are here.
         parser.add_argument(
-            "--version",
+            "--dataset-version",
             default=None,
             help="dataset version, e.g. v003 (default: DEFAULT_DATASET_VERSION)",
         )
@@ -58,24 +61,30 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):  # NOQA
-        version = options.get("version") or settings.DEFAULT_DATASET_VERSION
+        version = options.get("dataset_version") or settings.DEFAULT_DATASET_VERSION
         upload = not options.get("no_upload")
 
         if upload and not options.get("overwrite"):
-            if aws_helpers.s3_prefix_exists(
-                bucket=settings.AWS_DEFAULT_BUCKET, prefix=paths.dataset_key(version)
-            ):
+            if storage.prefix_exists(paths.dataset_uri(version)):
                 raise SystemExit(
                     f"{paths.dataset_uri(version)} already exists. A dataset version is what "
                     "every published number is keyed to -- build a new version, or pass "
                     "--overwrite if you really mean to replace this one."
                 )
 
-        data_root = paths.local_data_root()
-        if not options.get("skip_source_sync"):
-            print(f"syncing archive from {paths.source_uri()} (read-only, other account)")
+        source = paths.source_uri()
+        if options.get("skip_source_sync"):
+            data_root = paths.local_data_root()
+        elif storage.is_s3(source):
+            data_root = paths.local_data_root()
+            print(f"syncing archive from {source} (read-only)")
             print(f"free disk before sync: {free_disk_gb('/')} GB")
-            aws_helpers.sync_s3_to_local(s3_uri=paths.source_uri(), dest_path=data_root)
+            storage.sync_in(src=source, dest_path=data_root)
+        else:
+            # The archive is already a directory on this machine. Copying 11 GB into scratch to
+            # read it once would be a pure waste -- the build only ever reads it.
+            data_root = source
+            print(f"reading archive in place from {storage.describe(source)} (read-only)")
 
         out_root = paths.local_dataset_dir(version)
 
@@ -117,8 +126,8 @@ class Command(BaseCommand):
 
         if upload:
             uri = paths.dataset_uri(version)
-            print(f"uploading to {uri}")
-            aws_helpers.sync_local_to_s3(src_path=out_root, s3_uri=uri)
-            print(f"dataset {version} available at {uri}")
+            print(f"publishing to {storage.describe(uri)}")
+            storage.sync_out(src_path=out_root, dest=uri)
+            print(f"dataset {version} available at {storage.describe(uri)}")
         else:
             print(f"--no-upload: dataset left at {out_root}")

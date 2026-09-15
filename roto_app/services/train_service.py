@@ -2,15 +2,19 @@
 
 Four steps, and the middle one is the existing code called unchanged:
 
-1. sync the dataset version down from our bucket to local disk
+1. sync the dataset version down from the storage root to local disk
 2. run ``roto.v2.train.train`` on plain local paths
-3. sync the run directory back up, under the prefix its environment owns
+3. sync the run directory back, under the prefix its environment owns
 4. record what happened on the run row
 
 **Step 2 imports torch, and nothing above it does.** The import is inside the function rather
 than at module top so the web process -- which only ever launches runs and reads rows -- never
 pays for it, and so this module stays importable on a machine with no CUDA. That is the same
 lazy-heavy-import convention the sibling services use, for the same reason.
+
+**The storage root may be a bucket or a folder on disk, and nothing here knows which.** That
+is :mod:`roto_app.helpers.storage`'s job, and it is what lets this run before the
+infrastructure exists without the code that will run on ECS being different code.
 
 **Nothing here reaches into the archive.** Training needs only the derived dataset; the raw
 ``.sfx`` and EXRs are required to *build* it and never after, which is why the GPU task never
@@ -20,7 +24,7 @@ holds client footage. Building is a separate, CPU-only command.
 from django.conf import settings
 from django.utils import timezone
 
-from roto_app.helpers import aws_helpers
+from roto_app.helpers import storage
 from roto_app.helpers.utils import free_disk_gb
 from roto_app.models.run import (
     RUN_STAGE_COMPLETED,
@@ -84,9 +88,7 @@ def _sync_dataset(run) -> str:
         new_stage=RUN_STAGE_SYNCING_DATASET,
     )
     dataset_dir = paths.local_dataset_dir(run.dataset_version)
-    aws_helpers.sync_s3_to_local(
-        s3_uri=paths.dataset_uri(run.dataset_version), dest_path=dataset_dir
-    )
+    storage.sync_in(src=paths.dataset_uri(run.dataset_version), dest_path=dataset_dir)
     run.update_stage_logging(
         start_time=t,
         message_template="Dataset synced in {completion_time} seconds.",
@@ -135,7 +137,7 @@ def _sync_results(run) -> str:
         new_stage=RUN_STAGE_SYNCING_RESULTS,
     )
     uri = paths.run_uri(run.name, run.environment)
-    aws_helpers.sync_local_to_s3(src_path=paths.local_run_dir(run.name), s3_uri=uri)
+    storage.sync_out(src_path=paths.local_run_dir(run.name), dest=uri)
     run.update_stage_logging(
         start_time=t,
         message_template="Results synced in {completion_time} seconds.",

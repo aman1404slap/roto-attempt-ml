@@ -89,8 +89,12 @@ pip install -e ".[dev]"
 For the service — Django, Postgres in Docker, and the API — see
 [docs/service.md](docs/service.md).
 
-`data/`, `datasets/` and `runs/` are gitignored: archive material and generated artifacts stay
-out of version control, and in the deployed setup they live in S3.
+`data/`, `datasets/`, `runs/` and `abc/` are gitignored: archive material and generated
+artifacts stay out of version control.
+
+`abc/` is the local stand-in for the staging bucket — datasets and runs are read from and
+written to it with the same layout S3 will have, so local is staging with a different root
+rather than a second design. See [docs/service.md](docs/service.md).
 
 ## Commands
 
@@ -114,7 +118,7 @@ or the package installed.
 The **service** path is the same work, triggered over an API and run on ECS:
 
 ```bash
-python manage.py build_dataset --version v004 --tier tier1
+python manage.py build_dataset --dataset-version v004 --tier tier1
 python manage.py train_run --create --rung s3a --seed 1
 python manage.py score_run --rung s3a --seeds 1 2
 ```

@@ -40,6 +40,8 @@ env = environ.Env(
     # The archive, in another account. Read only, and nothing ever writes to it.
     SOURCE_S3_BUCKET=(str, "production-citadel"),
     SOURCE_S3_PREFIX=(str, ""),
+    STORAGE_ROOT=(str, ""),
+    SOURCE_ROOT=(str, ""),
     ROTO_ENVIRONMENT=(str, ""),
     RUN_EXECUTOR=(str, ""),
     SCRATCH_DIR=(str, ""),
@@ -141,6 +143,32 @@ SOURCE_S3_BUCKET = env("SOURCE_S3_BUCKET")
 SOURCE_S3_PREFIX = env("SOURCE_S3_PREFIX")
 """The archive, in another account, read only. Only the dataset build reads it; training never
 touches it, which is why the GPU task never has to hold client footage."""
+
+
+# --- Where datasets and runs are stored ---------------------------------------------------
+
+STORAGE_ROOT = env("STORAGE_ROOT") or (
+    f"s3://{AWS_DEFAULT_BUCKET}" if ENV != "local" and AWS_DEFAULT_BUCKET else "abc"
+)
+"""The root everything derived is read from and written to.
+
+``s3://<bucket>`` in staging; a gitignored folder -- ``abc`` -- locally, because until the
+infrastructure exists there is no bucket to write to and waiting for one would mean the service
+could not be run at all. **The layout inside is identical either way** (``datasets/<version>/``,
+``runs/staging/<run>/``, ``runs/local/<user>/<run>/``), so local is staging with a different
+root rather than a second design, and switching back is this one variable.
+
+Set explicitly to override -- a local process can point at the real bucket once it exists, and
+it should be possible to say so without also claiming to be staging."""
+
+SOURCE_ROOT = env("SOURCE_ROOT") or (
+    f"s3://{SOURCE_S3_BUCKET}/{SOURCE_S3_PREFIX}".rstrip("/")
+    if ENV != "local"
+    else "data/spline_dataset_08_25_26"
+)
+"""The archive the dataset build reads. Read-only, and nothing here ever writes to it.
+
+The cross-account bucket once that read exists; the delivery already on disk until then."""
 
 
 # --- How a run is executed ---------------------------------------------------------------

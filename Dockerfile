@@ -47,7 +47,7 @@ COPY . .
 # default job and nothing starts training by accident:
 #
 #   python3 ./manage.py train_run --run-id <uuid>
-#   python3 ./manage.py build_dataset --version v004 --tier tier1
+#   python3 ./manage.py build_dataset --dataset-version v004 --tier tier1
 #   python3 ./manage.py score_run --rung s3a --seeds 1 2
 #
 # The web service runs gunicorn instead:

@@ -23,14 +23,16 @@ HEADERS = {"HTTP_X_TASK_API_KEY": API_KEY}
 
 @override_settings(
     ROTO_APP_TASK_API_KEY=API_KEY,
-    AWS_DEFAULT_BUCKET="test-bucket",
+    STORAGE_ROOT="s3://test-bucket",
     DEFAULT_DATASET_VERSION="v003",
     ROTO_ENVIRONMENT="staging",
     RUN_EXECUTOR="ecs",
 )
 class CreateRunTests(TestCase):
     def setUp(self):
-        self.exists = mock.patch("roto_app.views.views.s3_prefix_exists", return_value=True).start()
+        self.exists = mock.patch(
+            "roto_app.views.views.storage.prefix_exists", return_value=True
+        ).start()
         self.launch = mock.patch("roto_app.services.launcher.launch").start()
         self.addCleanup(mock.patch.stopall)
 
@@ -238,7 +240,10 @@ class WebProcessStaysLightTests(TestCase):
 
 
 class S3PreflightTests(TestCase):
-    """The pre-flight check itself: it must not turn a configuration fault into a 'no'."""
+    """The S3 pre-flight check: it must not turn a configuration fault into a 'no'.
+
+    The folder backing's half of this is in ``test_storage.py``.
+    """
 
     def test_an_unset_bucket_raises_rather_than_returning_false(self):
         with self.assertRaises(S3Unavailable) as caught:
