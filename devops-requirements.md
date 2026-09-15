@@ -29,13 +29,26 @@ on demand and run for hours. ECS is the agreed target.
 - **ECS task role** with the two S3 permissions above. No long-lived access keys.
 - **Task execution role** for ECR pull and CloudWatch write.
 
+## Database
+
+- **A small PostgreSQL database** (RDS, or a schema on an existing instance). The API service
+  stores one row per training run — its parameters, stage, timings and result paths — which is
+  what `GET /runs/<id>` answers from after the triggering process is gone. Tiny: a handful of
+  rows a week, no growth to speak of. Locally we run Postgres in Docker; this is the deployed
+  equivalent.
+
 ## Our API service
 
-We expose an internal API to trigger, monitor and stop training jobs. Its role needs:
+We expose an internal API to trigger, monitor and stop training jobs. It is a Django service in
+the same shape as `autopilot-smart-vectors`, so the deployment story should be familiar. Its
+role needs:
 
 - `ecs:RunTask`, `ecs:DescribeTasks`, `ecs:StopTask`
 - `iam:PassRole` for the task and execution roles
 - `logs:GetLogEvents` on the task log group
+
+The training tasks it starts are launched with a **command override** — the task definition
+needs no default command, and one image serves every job (build a dataset, train, score).
 
 ## Networking
 
@@ -45,5 +58,7 @@ We expose an internal API to trigger, monitor and stop training jobs. Its role n
 
 ## Image
 
-- Base image with CUDA, or a Deep Learning container.
+- Base image with CUDA, or a Deep Learning container. Our Dockerfile builds on
+  `pytorch/pytorch:2.12.0-cuda13.0-cudnn9-runtime`.
 - Our stack: **Python 3.12, PyTorch 2.12 (CUDA 13.0), OpenCV with OpenEXR support.**
+- **ECR repository name: `roto`.** CI pushes from `ci/build.py`, as the sibling services do.

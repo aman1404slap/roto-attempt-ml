@@ -24,3 +24,9 @@ __pycache__/
 
 # Step write-ups: working notes, not project history
 steps/
+
+# Django service
+/.env
+/.scratch/
+/staticfiles/
+/infra/

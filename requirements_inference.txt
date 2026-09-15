@@ -1,0 +1,14 @@
+# The training stack, pinned.
+#
+# Migration note 5.6: pyproject declared numpy and opencv and did not declare torch at all --
+# it was installed ad hoc. Every number this project has published was measured on the versions
+# below, and a silent upgrade shifts them with nothing in the log to say why. torch is installed
+# in the Dockerfile with --index-url so it comes from the CUDA 13.0 build rather than the
+# default wheel.
+#
+# Changing any pin here means re-measuring the seed spread before the next result is quoted:
+# different kernels mean different floating-point ordering, and the whole method rests on
+# "a move smaller than the seed spread is weather".
+numpy==2.3.2
+opencv-python==4.12.0.88
+Pillow==11.3.0

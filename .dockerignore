@@ -1,0 +1,33 @@
+# The research tree is not part of the image and is large enough to matter: data/ is 11 GB for
+# 50 shots, v1.1/ alone is 381 MB. Datasets and runs arrive from S3 at runtime, never in the
+# image.
+.git
+.github
+.circleci
+__pycache__
+*.pyc
+*.egg-info
+.pytest_cache
+.mypy_cache
+.venv
+.env
+.scratch
+
+# client archive material and every derived artifact
+data/
+datasets/
+runs/
+viz/
+reports/
+_attic/
+v1/
+v1.1/
+v1.2/
+v1.3/
+steps/
+
+# notes, figures and write-ups
+*.jpg
+*.png
+luthra-understands/
+docs/

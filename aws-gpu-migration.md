@@ -1,9 +1,17 @@
 # Moving training off the laptop: AWS GPU migration
 
-**Status: proposed, not started. Written 2026-09-14.**
+**Status: the service is built; the infrastructure is not. Written 2026-09-14, updated
+2026-09-15.**
 
-The laptop GPU is going away — power limits now, a Mac shortly, and no CUDA on the other side.
-At the same time the target dataset is moving from 10 shots to a number two orders of magnitude
+What landed on 2026-09-15: the Django service (§3.3), environment stamping (§5.4), the pinned
+environment (§5.6) and parameterised run paths. v1 was deleted in the same pass. What is still
+open is everything that needs an AWS account — §4, §7's gates — plus §5.1, §5.2, §5.3 and §5.5.
+[docs/service.md](docs/service.md) is how the service works.
+
+Two premises changed and are corrected in place below: **local keeps CUDA** (so §2 and §5.7
+fall away), and **real training happens on AWS only** — local is a smoke test, nothing more.
+
+The laptop GPU is going away as the place results come from. At the same time the target dataset is moving from 10 shots to a number two orders of magnitude
 larger. This note says what we need, what has to change in the code before a cloud run can be
 trusted, and what the two scales imply.
 
@@ -88,17 +96,15 @@ If prod holds the larger population then §1's projections are the plan; if not,
 an acquisition question before it is an infrastructure one. This needs answering before the
 instance is sized.
 
-## 2. Test MPS on the Mac first — it may change what local means
+## 2. ~~Test MPS on the Mac first~~ — moot: local keeps CUDA
 
-An M-series Mac can plausibly run a 3M-parameter, 307 MB job at usable speed, which is what
-§3 needs *local* to be: a smoke test that the code runs on a GPU, not a result.
+**Struck, not deleted, because the reasoning was sound and the premise was wrong.** This section
+assumed local would become an M-series Mac with no CUDA, which made MPS operator coverage a real
+risk to the one thing local is for. Local keeps a CUDA GPU, so `--device cuda` remains the only
+path that matters and §5.7 falls away with it.
 
-`--device mps` runs today without a code change:
-[train.py:54](src/roto/v2/train.py#L54) passes the flag straight to `torch.device`. The risk is
-operator coverage — MPS still has gaps and the loss stack is where they would bite.
-
-**Do it in parallel with the paperwork, not instead of it.** The external lead times in §8 start
-whether or not MPS works.
+What survives is the *definition*: local is a smoke test that the code runs on a GPU, not a
+result. That is now enforced rather than agreed — see §5.4.
 
 ## 3. The target architecture
 
@@ -112,7 +118,7 @@ Two environments, one source of truth, one writable bucket.
             ├──────────────────────────────┐
             ▼                              ▼
   ┌─────────────────────┐        ┌─────────────────────────────┐
-  │  LOCAL (Mac)        │        │  STAGING (ECS GPU task)     │
+  │  LOCAL (CUDA box)   │        │  STAGING (ECS GPU task)     │
   │  a few shots        │        │  the real runs              │
   │  "does it run?"     │        │  two seeds, full schedule   │
   │                     │        │  triggered over an API      │
@@ -157,18 +163,23 @@ pieces: something that accepts a job and something that runs it. `POST /runs` en
 returns an id; `GET /runs/<id>` reports status; the worker runs the existing
 [train_v2.py](scripts/train_v2.py) as a subprocess and syncs results to staging.
 
-**On using the sibling Django service's shape for this:** the concern is that Django's ORM,
-migrations and admin are a lot of machinery for "enqueue a subprocess and report its status", and
-this service will never have a schema worth that. Against that, matching an existing in-house
-service means the deployment story, auth and conventions are already solved and reviewed. **If
-the sibling service is the house standard, follow it** — the overhead is real but small and
-one-time, and consistency across services is worth more than saving a few hundred lines here.
-Django plus Celery is a coherent answer to the blocking-job problem, which is the part that
-actually matters.
+**Decided 2026-09-15: follow the sibling Django service, and launch with `ecs:RunTask`.** The
+concern that Django's ORM, migrations and admin are a lot of machinery for "enqueue a job and
+report its status" was real, and the answer was the one stated here: matching an in-house
+service means the deployment story, auth and conventions are already solved and reviewed.
+
+Two things resolved in the building. The house has *two* execution models — `autopilot-smart-
+vectors`' RabbitMQ worker loop, and the older direct `ecs.run_task` with a container command
+override. **The second is the right one here** and is what the IAM request already asked for: a
+training run is one named, hours-long job with five parameters, not a stream of client tasks,
+and there is no broker to provision. And the `Run` row turned out to earn its keep — it is what
+`GET /runs/<id>` answers from once the launching process is gone, and ECS forgets a task within
+hours.
 
 **What the API must carry, whatever the framework:** the run name, the dataset version, the seed,
 the step count, and the environment tag. Those five are what make a run reproducible, and they
-belong in the request rather than in the worker's defaults.
+belong in the request rather than in the worker's defaults. They are columns on the `Run` model
+rather than payload, so they are queryable and cannot be optional.
 
 ## 4. Two accounts, and the three things that silently block one
 
@@ -235,7 +246,7 @@ policy: raise the cap, exclude wide layers with the exclusion recorded, or split
 current behaviour — a hard crash — is the right default and should stay**; what is missing is the
 decision about what to do when it fires.
 
-### 5.4 Stamp the environment on every run, and refuse to table a local one
+### 5.4 Stamp the environment on every run, and refuse to table a local one — **done**
 
 Everything in this project rests on not confusing weather for a result. Once local and staging
 write to the same bucket, a two-shot smoke test number becomes quotable by accident.
@@ -243,6 +254,16 @@ write to the same bucket, a two-shot smoke test number becomes quotable by accid
 Add `environment: local|staging` and the dataset fingerprint to `train_log.json`, and have the
 reporting path refuse to put a `local` run in a results table. Cheap, and it makes the guarantee
 structural rather than remembered.
+
+**Landed as [provenance.py](src/roto/v2/provenance.py).** The stamp goes on the *checkpoint* as
+well as the log, because scoring loads the checkpoint and that is where the refusal has to bite;
+`frozen_table` raises on a run stamped `local` whatever built the table. The fingerprint is a
+hash of the dataset's `manifest.json` — two runs with different fingerprints did not see the
+same data however alike their `--dataset` arguments looked, and a table mixing two of them says
+so. The environment comes from `ROTO_ENVIRONMENT` rather than from `TrainConfig`, so it is
+provenance rather than science and two otherwise-identical runs still compare equal. A run from
+before this exists reports `unstamped` and still tables; refusing those would void every
+published number.
 
 ### 5.5 Record source checksums in the build manifest
 
@@ -257,7 +278,7 @@ that *every mtime in the delivery is identical*, so final-file selection is alre
 content-derived rather than filesystem-derived. Hashing the inputs is the same principle one
 level up — and it is what makes Gate 1 (§7) a real test rather than an impression.
 
-### 5.6 Pin the environment
+### 5.6 Pin the environment — **done**
 
 [pyproject.toml](pyproject.toml) declares `numpy` and `opencv-python` and **does not declare
 torch at all** — it is installed ad hoc. We are on Python 3.12.12 and torch 2.12.0+cu130.
@@ -265,12 +286,16 @@ torch at all** — it is installed ad hoc. We are on Python 3.12.12 and torch 2.
 If the image silently gets a different torch, every number shifts and nothing will say why.
 Pin torch with its CUDA build, or add a lockfile. Required before the image can be built at all.
 
-### 5.7 Teach `pick_device` about MPS
+**Landed.** `torch==2.12.0` is declared in `pyproject.toml` and pinned in
+`requirements_inference.txt`, which the Dockerfile installs from the CUDA 13.0 index; the base
+image is `pytorch/pytorch:2.12.0-cuda13.0-cudnn9-runtime`. The file says out loud that changing
+a pin means re-measuring the seed spread before the next result is quoted.
 
-[train.py:54](src/roto/v2/train.py#L54) and
-[reconstruct.py:427](src/roto/v2/reconstruct.py#L427) both fall back `cuda → cpu`. On the Mac
-that means scoring, reconstruction and every figure script silently run on CPU — and under §3
-that is most of what local does.
+### 5.7 ~~Teach `pick_device` about MPS~~ — dropped with §2
+
+Local keeps CUDA, so the `cuda → cpu` fallback in
+[train.py](src/roto/v2/train.py) and [reconstruct.py](src/roto/v2/reconstruct.py) is correct as
+written and there is no third device to teach it about.
 
 ### 5.8 Cost reporting is CUDA-only
 
@@ -349,9 +374,10 @@ proceeds in parallel with the requests on the left.
 |---|---|
 | G-family vCPU quota request | **lazy alpha loading (§5.1) — precondition** |
 | `production-citadel` bucket policy, other account | checkpoint/resume (§5.2) |
-| KMS key policy question | pin the environment (§5.6) — blocks the image |
-| ECS cluster + ECR repository | manifest checksums (§5.5) |
-| MPS test on the Mac (§2) | environment stamping (§5.4) |
+| KMS key policy question | ~~pin the environment (§5.6)~~ — done |
+| ECS cluster + ECR repository `roto` | manifest checksums (§5.5) |
+| RDS instance for the service's run table | ~~environment stamping (§5.4)~~ — done |
+| | ~~the service itself (§3.3)~~ — done |
 
 The staging bucket is ours to create; it is not waiting on anyone.
 
@@ -369,6 +395,9 @@ The staging bucket is ours to create; it is not waiting on anyone.
    `OPENCV_IO_ENABLE_OPENEXR` env var is already handled
    ([exr.py:32](src/roto/exr.py#L32)); the wheel's build options are what vary.
 6. **Sequential or concurrent seeds** (§5.10) — decide and record.
+7. **What is the slot-cap policy?** Unchanged from question 3 and now more pressing: the API
+   will happily accept a run against a dataset built from wide layers, and the failure is a
+   `ValueError` twenty minutes into a GPU task.
 
 ---
 

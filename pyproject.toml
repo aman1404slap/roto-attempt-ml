@@ -1,12 +1,17 @@
 [project]
 name = "roto"
-version = "0.1.0"
-description = "Silhouette .sfx read/write, deterministic roto rendering, and evaluation harness"
-requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "opencv-python>=4.8"]
-
-[project.scripts]
-roto = "roto.cli:main"
+version = "0.2.0"
+description = "Silhouette .sfx read/write, deterministic roto rendering, and the v2 training harness"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    # Pinned, with its CUDA build, because every published number was measured on this one.
+    # A silent torch upgrade shifts the numbers and nothing in the logs would say why.
+    # See aws-gpu-migration.md section 5.6; the image installs the same pin from
+    # requirements_inference.txt.
+    "torch==2.12.0",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
@@ -21,3 +26,16 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+# Formatting applies to the Django service layer only. ``src/roto`` and ``scripts`` are the
+# research codebase: single quotes, its own wrapping, and diffs there should be changes in
+# meaning rather than a reformat. Running black over it would rewrite ~18k lines and destroy
+# the blame that every design note cites.
+[tool.black]
+line-length = 100
+extend-exclude = '^/(src|scripts|tests)/'
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_glob = ["src/*", "scripts/*", "tests/*"]

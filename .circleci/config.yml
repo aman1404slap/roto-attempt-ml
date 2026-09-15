@@ -1,0 +1,186 @@
+version: 2.1
+
+aliases:
+  - &allowed-branches
+    branches:
+      only:
+        - main
+        - /hotfix.*/
+        - staging
+        - track-updt
+        - develop
+  - &restore-pip-cache
+    keys:
+      - pip-{{ .Environment.CACHE_VERSION }}-{{ checksum "requirements.txt" }}
+  - &save-pip-cache
+    paths:
+      - .venv
+      - .env
+    key: pip-{{ .Environment.CACHE_VERSION }}-{{ checksum "requirements.txt" }}
+  - &persist-python-to-workspace
+    root: .
+    paths:
+      - .env
+      - .venv
+  - &attach-workspace
+    at: .
+
+executors:
+  python_executor:
+    docker:
+      - image: cimg/python:3.12.4
+        environment:
+          PIPENV_VENV_IN_PROJECT: true
+
+jobs:
+  pipenv:
+    executor: python_executor
+    steps:
+      - checkout
+      - run:
+          name: Add empty env file
+          command: echo "" >> .env
+      - run:
+          name: install build dependencies
+          command: sudo apt-get update && sudo apt-get install libcurl4-gnutls-dev && sudo apt-get install libpangocairo-1.0-0
+      - restore_cache: *restore-pip-cache
+      - run:
+          name: Install pip dependencies
+          no_output_timeout: 30m
+          command: |
+            pipenv run pip install -r requirements.txt
+            pipenv run pip install -r ci/requirements.txt
+      - save_cache: *save-pip-cache
+      - persist_to_workspace: *persist-python-to-workspace
+  docker-build-and-push:
+    executor: python_executor
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: docker23
+          docker_layer_caching: true
+      - attach_workspace: *attach-workspace
+      - run:
+          name: Docker Build
+          no_output_timeout: 30m
+          command: |
+            pipenv run python3 -u ./ci/build.py roto
+
+  black:
+    executor: python_executor
+    steps:
+      - checkout
+      - attach_workspace: *attach-workspace
+      - run:
+          name: run black
+          command: pipenv run black --check roto_app/
+
+  isort:
+    executor: python_executor
+    steps:
+      - checkout
+      - attach_workspace: *attach-workspace
+      - run:
+          name: run isort
+          command: pipenv run isort --check-only roto_app/
+
+  flake8:
+    executor: python_executor
+    steps:
+      - checkout
+      - attach_workspace: *attach-workspace
+      - run:
+          name: run flake8
+          command: pipenv run flake8 --ignore=E501,W503,W605,E203 roto_app/
+
+  django-tests:
+    executor: python_executor
+    steps:
+      - checkout
+      - attach_workspace: *attach-workspace
+      - run:
+          name: run the service test suite
+          command: pipenv run python3 manage.py test roto_app
+          environment:
+            # sqlite so CI needs no database service. The suite exercises views, auth and the
+            # launcher contract; none of that is Postgres-specific.
+            DATABASE_URL: sqlite:///ci.sqlite3
+            SECRET_KEY: ci-only
+
+  makemigrations-check:
+    executor: python_executor
+    steps:
+      - checkout
+      - attach_workspace: *attach-workspace
+      - run:
+          name: check makemigrations is up to date
+          command: pipenv run python3 manage.py makemigrations --check
+
+  deploy-staging:
+    executor: python_executor
+    steps:
+      - checkout
+      - attach_workspace: *attach-workspace
+      - add_ssh_keys:
+          fingerprints:
+            - "SHA256:Mt5utmlRIb3Bspgv0BALlaM7fOMywsN+2GTg1JaN2ss"
+      - run:
+          name: Deploy
+          command: |
+             pipenv run python3 -u ci/deploy.py staging roto
+
+  deploy-production:
+    executor: python_executor
+    steps:
+      - checkout
+      - attach_workspace: *attach-workspace
+      - add_ssh_keys:
+          fingerprints:
+            - "SHA256:Mt5utmlRIb3Bspgv0BALlaM7fOMywsN+2GTg1JaN2ss"
+      - run:
+          name: Deploy
+          command: |
+             pipenv run python3 -u ci/deploy.py production roto
+
+workflows:
+  version: 2
+  roto:
+    jobs:
+      - pipenv
+      - black:
+          requires:
+            - pipenv
+      - isort:
+          requires:
+            - pipenv
+      - flake8:
+          requires:
+            - pipenv
+      - makemigrations-check:
+          requires:
+            - pipenv
+      - django-tests:
+          requires:
+            - pipenv
+      - docker-build-and-push:
+          context: staging
+          filters: *allowed-branches
+          requires:
+            - makemigrations-check
+            - django-tests
+      - deploy-staging:
+          context: staging
+          filters: *allowed-branches
+          requires:
+            - docker-build-and-push
+      - deploy-production-approval:
+          type: approval
+          requires:
+            - deploy-staging
+          filters: *allowed-branches
+      - deploy-production:
+          context: production
+          filters: *allowed-branches
+          requires:
+            - deploy-production-approval
+

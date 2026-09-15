@@ -1,0 +1,35 @@
+# Local development: Postgres in Docker, Django and the training run on the host.
+#
+# The database is containerised and nothing else is, on purpose. Local exists to answer one
+# question -- does this code run on a GPU without crashing -- and putting the training process
+# inside a container adds the CUDA runtime, device passthrough and a volume mount between you
+# and that answer. The host already has CUDA; use it.
+#
+#   docker compose up -d db
+#   python manage.py migrate
+#   python manage.py runserver 5000
+#
+# The deployed database is RDS and is devops'. This file is only ever local.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: roto-postgres
+    environment:
+      POSTGRES_USER: roto
+      POSTGRES_PASSWORD: roto
+      POSTGRES_DB: roto
+    ports:
+      # 5433 on the host so it cannot collide with a Postgres already running there, which on
+      # a machine that also runs the sibling services it usually is.
+      - "5433:5432"
+    volumes:
+      - roto_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U roto -d roto"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  roto_pgdata:

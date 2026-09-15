@@ -29,197 +29,186 @@ partition, which is why a matte cannot simply be split back into its shapes.
 
 ## Status
 
-Current best, on the rebuilt dataset and the 11 layers a run trains on: **0.9749 soft IoU at
-0.80× the artist's keyframe count**, or **0.9703 with the artist's motion track taken away
-entirely**. v1 is complete: **13 layers across 4 shots reconstruct at 0.9218 soft IoU.** See
-[v1/OVERVIEW.md](v1/OVERVIEW.md) for what that means and [v1/tech.md](v1/tech.md) for how.
-`v1/` is frozen; its published numbers are reproducible at commit `2d1d53e`.
+**v2, at stage S3A.** Training runs on AWS, triggered over an API; see
+[docs/service.md](docs/service.md) for the service and
+[aws-gpu-migration.md](aws-gpu-migration.md) for why it moved and what is still open.
 
-v1.1 answers the v1 code review, and then a review of v1.1, on the same 13 layers:
-**0.9742 soft IoU**, 0.92 px point error, at 0.80× the artist's keyframe count — or **0.9712
-with a layer-motion head that also works** (0.9567 rendered, from 0.7938), which is the version
-to build v2 on. See [v1.1/OVERVIEW.md](v1.1/OVERVIEW.md),
-[v1.1/review-response.md](v1.1/review-response.md) and
-[v1.1/v1.1-review-response.md](v1.1/v1.1-review-response.md).
+The v2 ladder is one named configuration per charter S4 stage, in
+[`roto.v2.rungs`](src/roto/v2/rungs.py):
 
-v1.2 answers the handover written after v1.1 ([v1.1-to-v1.2-plan.md](v1.1-to-v1.2-plan.md)),
-which asks for something other than a better number: split every pixel of disagreement into
-**pipeline error**, which must be provably zero, and **model error**, which is minimised and
-reported *worst case*. It is a measurement round and it proposes no new headline model. What it
-established: the run-to-run noise floor is **±0.0069 soft IoU at 12k**, larger than most
-differences v1.1's ladder reports; the exactness ledger has 15 rows and found two that were
-silently wrong; and dropping the teacher-forced motion track entirely costs **0.0049** end to
-end, not the 0.043 the head's own isolated number implies. See [v1.2/OVERVIEW.md](v1.2/OVERVIEW.md)
-and [v1.2/plan-response.md](v1.2/plan-response.md).
+| rung | what it adds | outcome |
+|---|---|---|
+| `s0` | geometry and motion, structure given | 0.9717 on-screen soft IoU, 0.830 px, 1.119× keys |
+| `s1` | the key-timing head | run, closed, **does not pass** — over-random key F1 0.0914 against a 0.15 bar |
+| `s2a` | the loss reweight alone | preparation for S3; costs geometry nothing measurable |
+| `s2b` | the lifespan head | the rung the render gate is about |
+| `s2c` | the point-count head, `n_points` out of the query input | the training wheel off |
+| `s3a` | **one shared bank of 256 slots, replacing the per-element query table** | the live rung |
 
-The aggregate is the least informative number in that table. **The two layers that were broken
-went 0.7316 → 0.9533 and 0.7739 → 0.9614**, exactly as the v1 review predicted they would when
-it named shape-query collision as the cause; the mean moved only +0.051 because eight of the
-thirteen layers were already above 0.96 and had nothing left to give. Separately, 87% of the
-aggregate gain is training 3.3× longer on v1's unmodified configuration — at 12k steps nothing
-in the ladder has converged, which `v1_control_long` proves rather than assumes.
+**S3A is the open question and the default.** The S2 checkpoints reconstruct at 0.9652 with
+their query rows and **0.0377** with those rows freshly initialised, so the table was carrying
+~96% of the result and S3's whole job is to replace it. The model generalises perfectly within
+a shot (held-frame gap 0.0027) and not at all across shots (0.2031) —
+[luthra-understands/s3-attempts.md](luthra-understands/s3-attempts.md) is where that stands.
 
-v1.1 also corrects how the system is measured, referees four render conventions against
-Silhouette's own EXRs, and fixes three bugs found by scoring the case that must come out
-perfect — the strongest habit to carry forward. Because metric fixes landed, the same v1
-checkpoint no longer scores what v1 published, so v1.1 compares against a re-baselined row
-rather than 0.9218.
+**A larger archive starts at S3A, not at S0.** The rungs below it each answered one question
+about one change against a fixed dataset, and more data does not reopen them.
 
-v1.3 answers the handover written after v1.2 ([v1.2-to-v1.3-plan.md](v1.2-to-v1.3-plan.md)),
-whose reading was that "the model and method are no longer the bottleneck — the *ground* they
-stand on is". It rebuilds that ground once as `datasets/v002`, re-baselines every past number
-against it, writes real Silhouette projects for the first time, and defines done as eleven
-acceptance gates a script reads mechanically.
+Design notes, in order: [v2-s1-design-note.md](v2-s1-design-note.md),
+[v2-s2-design-note.md](v2-s2-design-note.md), [v2-s3-design-note.md](v2-s3-design-note.md).
+The rules are [v2_charter.md](v2_charter.md); the running record is
+[v2-tracker.md](v2-tracker.md).
 
-The reading was right, and by more than expected. **Re-rendering the targets correctly is worth
-+0.0048 soft IoU — slightly more than v1.1's whole architecture ladder (+0.0039) against the
-same anchor** — and it made the dataset two to eight times quieter run to run. The exactness
-ledger's last RED row is closed *exactly*: the artist's own program now scores
-**1.000000000 on every one of 1,810 frames** through the dataset's own uint16 round trip.
-`read(write(IR))` is bit-exact on all six archive shots and four dialects, and the eleven files
-in `v1.3/sfx/` re-read to the exact documents the report scores.
+### v1 is deleted
 
-Two findings are worth more than the headline. The rebuild exposed a **third instance of one bug
-class** — every scorer built its own `RenderConfig` and so silently reasserted v1's conventions
-for three of four, invisible on `v001` because v001's conventions *are* the class defaults. And
-the key-timing head **would have passed its own gate while having learned nothing**: it scored
-0.803 where firing on every live frame scores 0.797, because key density ranges 13× across these
-layers. Every key metric now carries the baselines that make it readable — which showed that
-v1.2's published 0.408 key F1 is 0.322 of random placement plus 0.086 of skill.
+v1 through v1.3 shipped and were removed on 2026-09-15. The boundary that made that a delete
+rather than an untangling is documented in [`roto/v2/__init__.py`](src/roto/v2/__init__.py) and
+enforced by `tests/test_v2_boundary.py`, which now asserts the modules stay gone. What each
+round established, and the numbers it published, are in git history at `af51dfb` and earlier.
 
-The head itself fails as a key *detector* (at trivial baseline, both seeds, both schedules) and
-works as a *bias* on the keyframe search: **key F1 0.518 against v1.2's best-ever 0.408**, at an
-editable key economy and no measurable cost in soft IoU. Six of ten measurable gates pass, and
-three of the four failures are a single 16-shape layer that √ weighting sacrifices — so the
-plan's "the failing gate names the next rung" resolves to one parameter. See
-[v1.3/OVERVIEW.md](v1.3/OVERVIEW.md), [v1.3/plan-response.md](v1.3/plan-response.md) and
-[v1.3/tech.md](v1.3/tech.md).
+Three things v1 established that v2 still rests on, recorded because they are load-bearing and
+no longer have a document of their own:
 
-All of them are an **overfit** — trained and measured on the same layers. v1.3 adds the plumbing
-a generalisation claim needs (a build-time split that withholds two layers, and the measurement
-that with untrained query rows the encoder alone scores 0.238) and makes none: a layer is not a
-shot. That is still v2.
+- **Re-rendering the targets correctly was worth +0.0048 soft IoU** — more than v1.1's whole
+  architecture ladder against the same anchor. The ground mattered more than the model.
+- **Every scorer that builds its own `RenderConfig` silently reasserts the wrong conventions.**
+  That bug class appeared three times. It is why the dataset owns its conventions.
+- **A head can pass its own gate having learned nothing.** The v1.3 key head scored 0.803 where
+  firing on every live frame scores 0.797, because key density ranges 13× across layers. Every
+  key metric carries its trivial baselines for that reason.
 
 ## Setup
 
-Python ≥ 3.10, numpy, opencv-python, torch (CPU is enough), matplotlib.
+Python 3.12, numpy, opencv-python, torch. A CUDA GPU for training; CPU is enough to build a
+dataset or read the archive.
 
 ```bash
 pip install -e ".[dev]"
-mkdir -p data/extracted && unzip data/test_data.zip -d data/extracted
 ```
 
-`data/` is gitignored — archive material stays out of version control.
+For the service — Django, Postgres in Docker, and the API — see
+[docs/service.md](docs/service.md).
+
+`data/`, `datasets/` and `runs/` are gitignored: archive material and generated artifacts stay
+out of version control, and in the deployed setup they live in S3.
 
 ## Commands
 
-```
-roto inventory [data_root]              what is in the archive
-roto parse     <shot_dir> [-o out]      .sfx -> readable JSON
-roto layers    [--all]                  layers available for training
-roto dataset   <out_dir>                render mattes + spline programs
-```
-
-Full run, start to finish:
+Everything runs two ways. The **shell** path needs nothing but the package, and is how an
+experiment is driven:
 
 ```bash
-roto layers                                     # 13 of 18 layers selected
-roto dataset datasets/v001 --size 256           # ~30 min, CPU-bound
-python -c "from roto.model import train, TrainConfig; \
-           train('datasets/v001','v1/model', TrainConfig(steps=12000))"
-python scripts/eval_keys.py datasets/v001       # keyframe search on its own
-python scripts/report_v1.py                     # scores + figures
+export PYTHONPATH=src                                   # or pip install -e .
+
+python -m roto.v2 dataset datasets/v003 --tier tier1    # build a dataset
+python -m roto.v2 ledger  datasets/v003                 # the exactness ledger; non-zero on RED
+python -m roto.v2 subset                                # the shot selection and its reasons
+
+python scripts/train_v2.py s3a --seed 1                 # train one rung, one seed
+python scripts/score_v2.py s3a --seeds 1 2              # score into the frozen table
 ```
 
-## Which layers are used
+The `scripts/` entry points put `src` on the path themselves; `python -m roto.v2` needs it set
+or the package installed.
 
-A layer is selected unless a measured rule excludes it:
+The **service** path is the same work, triggered over an API and run on ECS:
 
-| rule | threshold | fires on |
-|---|---|---|
-| `over_keyed` | > 0.75 keys per live frame | 3 layers, at 0.95–1.59 |
-| `paint_strokes` | > 0.9 of shapes are open strokes | 2 layers, both at 1.00 |
-| `too_few_shapes` | < 3 shapes | 1 layer, at 2 |
+```bash
+python manage.py build_dataset --version v004 --tier tier1
+python manage.py train_run --create --rung s3a --seed 1
+python manage.py score_run --rung s3a --seeds 1 2
+```
 
-13 of 18 top-level layers pass: 1,810 mattes, 2,753 shapes, 22,929 artist keyframes.
+They share the rung catalogue and the training loop — the service adds S3 sync and a row in a
+database, and nothing else. That is deliberate: `src/roto/` has no Django in it and no knowledge
+that the service exists.
 
-The `over_keyed` threshold reads a real gap rather than cutting an arbitrary tail — 14 layers
-sit at 0.03–0.59 and four at 0.95–1.59, with nothing between.
+## Which shots are used
+
+v2 **tags rather than excludes** (charter S6, D4). v1 dropped a layer when a measured rule
+fired; v2 records the grade and lets the run decide, because a threshold calibrated on 18
+archive layers is not a property of the task. The selection and every reason is
+[`roto.v2.subset`](src/roto/v2/subset.py), printable with `python -m roto.v2 subset`.
+
+The archive is **50 shots**: 4 excluded outright, 3 deferred for size, 10 Tier 1, 5 Tier 2.
+`datasets/v003` is Tier 1 — 10 shots, 21 elements, 1,412 element-frames.
+
+Pairing QC grades each element gold or silver and can fail a whole shot; the grade travels with
+the element into the manifest rather than deciding for it.
 
 ## Layout
 
 ```
-src/roto/
+src/roto/          the science. No Django, no boto3.
   ir.py            the intermediate representation everything converts through
-  shots.py         locating each shot's .sfx
   metrics.py       iou, soft_iou
   exr.py           Silhouette's delivered mattes, for refereeing render conventions
+  smoothing.py     track smoothing, shared
   sfx/             .sfx reader, JSON form, writer seam
   render/          deterministic rasteriser (curves, raster)
-  dataset/         layer manifest -> matte + spline program per layer
   program/         spline program <-> dense arrays
   keys/            keyframe selection by curve simplification, key-value refit
-  model/           network, training, reconstruction, smoothing, curve loss, figures
-scripts/           eval_keys.py, report_v1.py, and the v1.1 set:
-                   train_v11.py / report_v11.py / summarise_v11.py,
-                   sweep_operating_point.py, fig_worst_layers.py,
-                   exp_conventions.py, exp_peak_frames.py,
-                   exp_offset_jitter.py, exp_affine_target.py
-                   ...the v1.2 set: ledger.py (the exactness ledger),
-                   train_v12.py / report_v12.py / summarise_v12.py,
-                   exp_scoring_ceiling.py, exp_noise_floor.py, fig_worst_frames.py
-                   ...and the v1.3 set: train_v13.py / report_v13.py /
-                   summarise_v13.py / sweep_v13.py, gates.py (the acceptance
-                   gates), rebaseline_v13.py (re-anchoring across datasets),
-                   write_sfx_v13.py, queue_v13.sh / score_v13.sh /
-                   autoscore_v13.sh / track_v13.py (the run queue and its ETA)
-tests/             148 tests
-v1/                deliverables (gitignored): docs, checkpoint, results, figures
-v1.1/              same, for the review response: ladder, sweeps, referees
-v1.2/              same, for the handover: the ledger, the noise floor, worst-case tables
-v1.3/              same, for the consolidation round: the rebuilt dataset, the
-                   acceptance gates, the key-timing head, and real .sfx files
+  dataset/         crop, arrays, layers — version-independent mechanics
+  v2/              the round: ingest, manifest, qc, build, splits, dataset, ledger,
+                   traindata, net, losses, train, config, rungs, reconstruct,
+                   score, report, provenance, subset, cli
+
+roto_app/          the service. Django, orchestration only.
+  models/run.py    one row per training run
+  views/           the API: create, status, stop
+  services/        paths (the S3 layout), launcher (ecs | local), train_service
+  helpers/         aws (sync), ecs (RunTask/Describe/Stop), utils
+  management/commands/  build_dataset, train_run, score_run — what a container runs
+
+scripts/           train_v2.py, score_v2.py, and the S2/S3 experiments:
+                   exp_s2_baselines.py, exp_s2_visibility.py, exp_s3_baselines.py,
+                   sweep_s2_lifespan.py, fig_s2_attempt.py, fig_different_answer.py
+tests/             the science suite — 108 tests, no database, no Django
+roto_app/tests/    the service suite — 17 tests
+ci/, .circleci/    build, deploy and pipeline, in the house shape
+Dockerfile         one image; the command override decides which job it does
+docker-compose.yml local Postgres, and nothing else
 ```
 
 ## Tests
 
+Two suites, because there are two codebases and the boundary between them is the point.
+
 ```bash
-pytest                    # 148 tests, ~170s — they render real archive frames
-python scripts/ledger.py  # the exactness ledger; exits non-zero if a row is red
+pytest                            # the science: 108 tests, ~25s — they render real frames
+python manage.py test roto_app    # the service: 17 tests, sqlite is fine
+PYTHONPATH=src python -m roto.v2 ledger datasets/v003   # the exactness ledger
 ```
 
 Five carry the most weight:
 
-- **`test_dataset.py`** asserts `decode(encode(program))` renders back to the layer's own
-  matte, at strides 1, 7 and 20. Tolerance is `1e-4`, which is 16-bit PNG quantisation on the
-  stored matte and nothing else. If it needs raising, the representation lost something.
+- **`test_v2_dataset.py`** asserts the built dataset is what it claims: the program round-trips
+  to the element's own alpha, and the split recorded at build time is the split training reads.
 - **`test_keys.py`** measures keyframe selection against tracks with planted, known keyframes,
   so it is scored on ground truth rather than on its own output.
-- **`test_v11.py`** pins the transform representation both ways: that the 6-number affine form
-  the pipeline shipped with is *lossy* on a perspective transform, and that the 8-number
-  projective form replacing it is exact. That asymmetry was a real ceiling on a real head, and
-  a test is the only thing that stops it coming back.
-- **`test_v12.py`** checks the two conversions nothing was watching — that window alignment uses
-  the offsets the targets were built with, and that the transform loss's probe points land where
-  the renderer puts them, both to 1e-9 crop px on the real archive. It also pins the
-  de-teacher-forcing path the only way that means anything: hand it the artist's own transform
-  track and it must reproduce the teacher-forced reconstruction exactly.
-- **`test_v13.py`** asserts that two code paths agree on the real archive, because that is how
-  every bug this project has found actually hid. The scorer's render conventions must be the
-  dataset's own — the test fails if the class defaults stop being wrong, so it cannot rot into
-  a tautology. `read(write(IR))` must be bit-exact in both containers. And the key-timing head
-  must *vary with the frame*: a head wired to the raw query embedding would train, report a
-  falling loss, and predict a constant.
+- **`test_v2_s2.py`** pins the S2 heads' semantics — lifespan, point count, and the decode that
+  turns them into shapes — including that a head must *vary with the frame*. A head wired to the
+  raw query embedding would train, report a falling loss, and predict a constant.
+- **`test_v2_boundary.py`** asserts v1 stays deleted, that v2 names none of its modules, and
+  that importing v2's dataset path pulls in neither torch nor any v1 module.
+- **`test_v2_provenance.py`** asserts the thing everything else rests on: a run stamped `local`
+  cannot reach a results table, a mixed-fingerprint table says so, and a run from before
+  stamping still tables rather than being voided.
 
 ## Not in scope yet
 
-- **Generalising to unseen shots.** v1.3 puts the plumbing in — `datasets/v002` withholds two
-  layers from training at build time — but a layer is not a shot, and shape queries are
-  per (layer, shape), so nothing here is a generalisation claim.
+- **Generalising to unseen shots.** This is what S3 is for and it is not solved: the model
+  generalises within a shot (held-frame gap 0.0027) and not across shots (0.2031). The dataset
+  withholds whole shots at build time, so the claim is measurable; it is not yet earned.
 - **Harder inputs.** The matte is rendered from the answer, so it is perfectly clean. A plate,
   or a mask from another tool, is not.
 
-Writing a real `.sfx` **is** now in scope: [src/roto/sfx/write.py](src/roto/sfx/write.py)
-emits both containers and all four dialects, and `read(write(IR))` is bit-exact on every
-archive shot. What is still open is one file **opened in Silhouette**, which needs a licence
-seat — see [v1.3/sfx/README.md](v1.3/sfx/README.md) for the fifteen-minute check.
+- **Scale.** The dataset is 10 shots of an archive of 50, and the plan targets 1,000. Two
+  things break before that and neither is fixed by a bigger instance: alphas are materialised
+  into RAM up front (~75 GB at 1,000 shots), and a 40k-step schedule that is 170 passes over
+  today's data is 1.7 over that one. Both are named in
+  [aws-gpu-migration.md](aws-gpu-migration.md) §5.1 and §1.
+
+Writing a real `.sfx` **is** in scope: [src/roto/sfx/write.py](src/roto/sfx/write.py) emits both
+containers and all four dialects, and `read(write(IR))` is bit-exact on every archive shot. What
+is still open is one file **opened in Silhouette**, which needs a licence seat.

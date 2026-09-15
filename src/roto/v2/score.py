@@ -40,6 +40,7 @@ import numpy as np
 
 from .build import element_dirs
 from .reconstruct import (RebuildConfig, assemble, load_model, predict, untrained_queries)
+from .provenance import UNSTAMPED, check_quotable, environment_of
 from .report import by_training_status
 from .splits import load_splits
 from .traindata import load_element
@@ -146,6 +147,9 @@ def score_run(checkpoint: str | Path, dataset: str | Path | None = None,
     out['rows'] = rows
     out['checkpoint'] = str(checkpoint)
     out['dataset'] = str(root)
+    # Carried from the checkpoint so the table can refuse a local run without also needing
+    # the run directory to hand. See roto.v2.provenance.
+    out['provenance'] = ck.get('provenance') or {}
     out['held_shots'] = sorted(held_shots)
     out['held_shot_elements'] = sorted(r['element_id'] for r in rows if r['held_shot'])
     out['frozen_elements'] = sorted(frozen_ids)
@@ -155,7 +159,8 @@ def score_run(checkpoint: str | Path, dataset: str | Path | None = None,
     return out
 
 
-def frozen_table(runs: Sequence[dict[str, Any]], label: str = 'v2 S0 baseline') -> str:
+def frozen_table(runs: Sequence[dict[str, Any]], label: str = 'v2 S0 baseline',
+                 allow_local: bool = False) -> str:
     """The table whose format ``v2_implementation_plan.md`` S2 freezes.
 
     Charter L4 governs how it is read: two seeds minimum, and a difference smaller than the
@@ -168,7 +173,15 @@ def frozen_table(runs: Sequence[dict[str, Any]], label: str = 'v2 S0 baseline') 
     **held-out shot** block is the only generalisation claim in the table. The
     **encoder-only** block is what the withheld elements score with freshly initialised query
     rows -- not a generalisation number, but the floor charter S4's S3 has to beat.
+
+    **A run stamped ``local`` is refused outright** (``allow_local`` to look anyway). Local is
+    a smoke test -- a short schedule on a handful of shots, run to prove the code executes --
+    and once local and staging write to the same bucket the only thing standing between a
+    probe and a results table is this check. A run from before stamping exists carries no
+    stamp; it tables, and the header says so rather than pretending it was verified.
     """
+    if not allow_local:
+        check_quotable(list(runs), what=f'the {label} table')
     def col(key: str, block: str | None = None):
         vals = []
         for r in runs:
@@ -182,7 +195,21 @@ def frozen_table(runs: Sequence[dict[str, Any]], label: str = 'v2 S0 baseline') 
     n = len(runs)
     head = (f'{n} seeds, mean and spread' if n > 1
             else 'ONE SEED -- not a mean; charter L4 wants two before this is quotable')
-    lines = [f'{label} -- {runs[0]["dataset"]} -- {head}', '',
+    envs = sorted({environment_of(r) for r in runs})
+    prints = [f'{label} -- {runs[0]["dataset"]} -- {head}']
+    fp = sorted({(r.get('provenance') or {}).get('dataset_fingerprint') for r in runs}
+                - {None})
+    if envs != ['staging'] or len(fp) > 1:
+        # Said out loud rather than assumed: which environment produced these, and whether
+        # the seeds even saw the same build. Two fingerprints in one table is a comparison
+        # across datasets wearing one dataset's name.
+        note = f'environment {"/".join(envs)}'
+        if envs == [UNSTAMPED]:
+            note += ' (run before provenance stamping; environment not recorded)'
+        if len(fp) > 1:
+            note += f' -- WARNING: {len(fp)} different dataset fingerprints in one table'
+        prints.append(note)
+    lines = [*prints, '',
              f'{"":38s} {"value":>10s} {"spread":>9s}']
 
     def section(title, rows, block=None):

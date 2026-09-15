@@ -146,7 +146,7 @@ def smooth_offsets(offsets: dict[int, tuple[int, int]], frames: Sequence[int],
     fractional one would mean resampling the alpha, which would blur the very edges soft IoU
     is measuring.
     """
-    from ..model.smoothing import SAVGOL, smooth_track
+    from ..smoothing import SAVGOL, smooth_track
 
     order = [f for f in frames if f in offsets]
     track = np.array([offsets[f] for f in order], float)

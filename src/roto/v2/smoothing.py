@@ -1,6 +1,6 @@
 """Temporal smoothing of a predicted track.
 
-Ported from ``roto.model.smoothing`` at v2 Step 2, unchanged.
+Ported from ``roto.smoothing`` at v2 Step 2, unchanged.
 """
 
 from __future__ import annotations

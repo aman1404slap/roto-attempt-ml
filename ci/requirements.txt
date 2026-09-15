@@ -1,0 +1,14 @@
+# CI-only tooling, installed on top of requirements.txt.
+#
+# Deliberately does NOT include torch, numpy or opencv. CI lints the service layer and runs the
+# service test suite, and neither needs the training stack -- the heavy imports are inside the
+# functions that use them, and `roto.v2.rungs` imports only a dataclass. A CI job that installs
+# a CUDA torch wheel to check a rung name would take minutes and prove nothing.
+#
+# The science suite (`pytest tests/`) does need numpy, opencv and torch. It is not run here;
+# see docs/service.md for why that is a deliberate gap rather than an oversight.
+black==24.8.0
+flake8==7.1.1
+isort==5.13.2
+git-python==1.0.3
+PyYAML==6.0.2

@@ -1,9 +1,11 @@
-"""``roto.v2`` must not import v1, so that v1 can be deleted without touching v2.
+"""v1 is deleted, and this is what keeps it deleted.
 
-The boundary is documented in ``roto/v2/__init__.py``. This test is what makes it true: a
-docstring saying "do not import v1" is a wish, and an import added in a hurry six weeks from now
-would silently re-couple the two. Walking the AST is cheap and it fails on the import itself
-rather than on whatever breaks later.
+The boundary was written so v1 could be removed without touching v2, and it worked: the
+removal was a delete, not an untangling. The test outlives its original job. A docstring
+saying "v1 is gone" is a wish, and a module re-added in a hurry six weeks from now -- or an
+import of one -- would re-couple the two silently. So this now asserts both halves: the v1
+modules do not exist, and nothing in v2 names them. Walking the AST is cheap and it fails on
+the import itself rather than on whatever breaks later.
 """
 from __future__ import annotations
 
@@ -17,11 +19,21 @@ V1_ONLY = {
     'model', 'shots',
     'dataset.build', 'dataset.manifest', 'dataset.splits',
 }
-"""Modules v2 replaces or does not need. Deleting these must not break ``roto.v2``.
+"""v1's modules, deleted. Neither the files nor an import of them may come back.
 
 ``dataset.crop``, ``dataset.arrays`` and ``dataset.layers`` are deliberately absent: they are
-version-independent mechanics that v2 reuses as-is.
+version-independent mechanics that v2 reuses as-is, and they survived the deletion. So did
+``roto.smoothing``, which was ``roto.model.smoothing`` until v1 was removed -- it is a track
+smoother with no v1 in it, and ``dataset.crop`` needs it.
 """
+
+
+def test_v1_modules_are_gone():
+    """The deletion, asserted. A re-added ``roto/model/`` would pass every other test here."""
+    back = [f'roto.{m}' for m in sorted(V1_ONLY)
+            if ROTO.joinpath(*m.split('.')).with_suffix('.py').exists()
+            or (ROTO.joinpath(*m.split('.')) / '__init__.py').exists()]
+    assert not back, 'v1 modules are back:\n  ' + '\n  '.join(back)
 
 
 def _imported_roto_modules(path: Path) -> set[str]:

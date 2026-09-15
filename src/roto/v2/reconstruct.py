@@ -154,7 +154,7 @@ Measured in v1, at 1.0 px tolerance: turning smoothing on raised rendered soft-I
 layer tried (0.9820 -> 0.9846, 0.9605 -> 0.9653, 0.7651 -> 0.7763) *and* cut the key count
 from 3.01x the artist's to 0.99x. Both improve together because the keys it removes were
 spent tracking noise, not motion. Which *filter* does the smoothing is a separate question --
-see ``roto.model.smoothing``.
+see ``roto.smoothing``.
 """
 
 
